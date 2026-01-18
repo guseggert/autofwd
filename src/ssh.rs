@@ -116,6 +116,24 @@ pub async fn ssh_forward_cancel(
     Ok(())
 }
 
+/// Check if the ControlMaster is still alive.
+pub async fn ssh_master_check(ctx: &SshContext) -> bool {
+    Command::new("ssh")
+        .args(&ctx.ssh_args)
+        .arg("-S")
+        .arg(ctx.control_path.to_string_lossy().to_string())
+        .arg("-O")
+        .arg("check")
+        .arg(&ctx.target)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Gracefully exit the ControlMaster and clean up the socket.
 pub async fn ssh_master_exit(ctx: &SshContext) {
     let _ = Command::new("ssh")

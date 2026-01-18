@@ -7,7 +7,7 @@ use tokio::process::Command;
 
 use crate::ports::{find_free_local_port, PortFilter};
 use crate::proc_net::{parse_proc_net_output, remote_host_for, HostPref};
-use crate::ssh::{ssh_forward_add, ssh_forward_cancel, SshContext};
+use crate::ssh::{ssh_forward_add, ssh_forward_cancel, ssh_master_check, ssh_master_start, SshContext};
 use crate::tui::{CommandReceiver, ForwardedPort, SharedState, TuiCommand};
 
 const END_MARKER: &str = "__AUTOFWD_END__";
@@ -251,19 +251,13 @@ async fn handle_toggle(
     }
 }
 
-/// Run the monitoring loop that detects new ports and forwards them.
-pub async fn run_monitor(
-    ctx: SshContext,
-    filter: PortFilter,
+/// Spawn the monitor SSH session and return the child process and line reader.
+async fn spawn_monitor_session(
+    ctx: &SshContext,
     interval: Duration,
-    collision_tries: u16,
-    tui_state: SharedState,
-    mut cmd_rx: CommandReceiver,
-) -> Result<()> {
+) -> Result<(tokio::process::Child, tokio::io::Lines<BufReader<tokio::process::ChildStdout>>)> {
     let script = remote_monitor_script(interval);
 
-    // Pass the script via stdin to avoid shell quoting issues.
-    // SSH runs `sh` on the remote, which reads the script from stdin.
     let mut child = Command::new("ssh")
         .args(&ctx.ssh_args)
         .arg("-S")
@@ -273,7 +267,7 @@ pub async fn run_monitor(
         .arg("sh")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null()) // Suppress stderr in TUI mode
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| anyhow!("failed to spawn ssh monitor session: {e}"))?;
 
@@ -286,7 +280,6 @@ pub async fn run_monitor(
             .ok_or_else(|| anyhow!("failed to capture monitor stdin"))?;
         stdin.write_all(script.as_bytes()).await?;
         stdin.shutdown().await?;
-        // stdin is dropped here, closing the pipe
     }
 
     let stdout = child
@@ -294,44 +287,154 @@ pub async fn run_monitor(
         .take()
         .ok_or_else(|| anyhow!("failed to capture monitor stdout"))?;
 
-    let mut lines = BufReader::new(stdout).lines();
-    let mut state = MonitorState::new();
+    let lines = BufReader::new(stdout).lines();
+    Ok((child, lines))
+}
 
-    loop {
-        // Check if TUI wants us to quit
+/// Re-establish all active forwards after a reconnection.
+async fn reestablish_forwards(ctx: &SshContext, state: &mut MonitorState, tui_state: &SharedState) {
+    let forwards_to_restore: Vec<_> = state.forwards.drain().collect();
+    
+    for (remote_port, info) in forwards_to_restore {
+        match ssh_forward_add(ctx, info.local_port, &info.remote_host, remote_port).await {
+            Ok(()) => {
+                state.forwards.insert(remote_port, ForwardInfo {
+                    local_port: info.local_port,
+                    remote_host: info.remote_host,
+                });
+            }
+            Err(e) => {
+                let mut tui = tui_state.write().await;
+                tui.push_event(format!("✗ restore :{} failed: {}", remote_port, e));
+                // Mark as disabled in TUI
+                if let Some(fwd) = tui.forwarded.iter_mut().find(|f| f.remote_port == remote_port) {
+                    fwd.enabled = false;
+                }
+            }
+        }
+    }
+}
+
+/// Run the monitoring loop that detects new ports and forwards them.
+pub async fn run_monitor(
+    ctx: SshContext,
+    filter: PortFilter,
+    interval: Duration,
+    collision_tries: u16,
+    tui_state: SharedState,
+    mut cmd_rx: CommandReceiver,
+) -> Result<()> {
+    let mut state = MonitorState::new();
+    let mut reconnect_delay = Duration::from_secs(1);
+    const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+    // Outer loop handles reconnection
+    'reconnect: loop {
         if tui_state.read().await.should_quit {
             break;
         }
 
-        // Use a timeout so we can check should_quit and commands periodically
-        tokio::select! {
-            result = lines.next_line() => {
-                match result {
-                    Ok(Some(line)) => {
-                        let trimmed = line.trim();
-                        if trimmed == END_MARKER {
-                            process_snapshot(&mut state, &ctx, &filter, collision_tries, &tui_state).await;
-                        } else if let Some(uid_str) = trimmed.strip_prefix(UID_PREFIX) {
-                            // Parse and store the user's UID for filtering
-                            if let Ok(uid) = uid_str.parse::<u32>() {
-                                state.user_uid = Some(uid);
+        // Spawn monitor session
+        let (mut child, mut lines) = match spawn_monitor_session(&ctx, interval).await {
+            Ok(result) => {
+                reconnect_delay = Duration::from_secs(1); // Reset delay on success
+                result
+            }
+            Err(e) => {
+                // Check if ControlMaster is dead
+                if !ssh_master_check(&ctx).await {
+                    {
+                        let mut tui = tui_state.write().await;
+                        tui.status = "reconnecting...".to_string();
+                        tui.push_event("! connection lost, reconnecting...".to_string());
+                    }
+
+                    // Try to restart the ControlMaster
+                    if let Err(e) = ssh_master_start(&ctx).await {
+                        let mut tui = tui_state.write().await;
+                        tui.push_event(format!("✗ reconnect failed: {}", e));
+                        
+                        // Exponential backoff
+                        tokio::time::sleep(reconnect_delay).await;
+                        reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+                        continue 'reconnect;
+                    }
+
+                    // Re-establish forwards
+                    reestablish_forwards(&ctx, &mut state, &tui_state).await;
+                    
+                    {
+                        let mut tui = tui_state.write().await;
+                        tui.push_event("✓ reconnected".to_string());
+                    }
+                    continue 'reconnect;
+                }
+
+                let mut tui = tui_state.write().await;
+                tui.push_event(format!("✗ monitor error: {}", e));
+                tokio::time::sleep(reconnect_delay).await;
+                reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+                continue 'reconnect;
+            }
+        };
+
+        // Reset monitor state for new session (keep forwards info)
+        state.snapshot_lines.clear();
+        state.user_uid = None;
+        state.initialized = false;
+
+        // Inner loop processes the monitor output
+        loop {
+            if tui_state.read().await.should_quit {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                break 'reconnect;
+            }
+
+            tokio::select! {
+                result = lines.next_line() => {
+                    match result {
+                        Ok(Some(line)) => {
+                            let trimmed = line.trim();
+                            if trimmed == END_MARKER {
+                                process_snapshot(&mut state, &ctx, &filter, collision_tries, &tui_state).await;
+                            } else if let Some(uid_str) = trimmed.strip_prefix(UID_PREFIX) {
+                                if let Ok(uid) = uid_str.parse::<u32>() {
+                                    state.user_uid = Some(uid);
+                                }
+                            } else {
+                                state.snapshot_lines.push(line);
                             }
-                        } else {
-                            state.snapshot_lines.push(line);
+                        }
+                        Ok(None) => {
+                            // EOF - connection likely died
+                            let mut tui = tui_state.write().await;
+                            tui.status = "connection lost...".to_string();
+                            tui.push_event("! monitor session ended".to_string());
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue 'reconnect;
+                        }
+                        Err(e) => {
+                            let mut tui = tui_state.write().await;
+                            tui.push_event(format!("! read error: {}", e));
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue 'reconnect;
                         }
                     }
-                    Ok(None) => break, // EOF
-                    Err(e) => return Err(anyhow!("monitor read error: {e}")),
                 }
-            }
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    TuiCommand::ToggleForward { index } => {
-                        handle_toggle(&ctx, &tui_state, &mut state, index).await;
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        TuiCommand::ToggleForward { index } => {
+                            handle_toggle(&ctx, &tui_state, &mut state, index).await;
+                        }
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
 
@@ -339,9 +442,6 @@ pub async fn run_monitor(
     for (remote_port, info) in &state.forwards {
         let _ = ssh_forward_cancel(&ctx, info.local_port, &info.remote_host, *remote_port).await;
     }
-
-    let _ = child.kill().await;
-    let _ = child.wait().await;
 
     Ok(())
 }
