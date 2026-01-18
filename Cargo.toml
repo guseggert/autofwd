@@ -1,0 +1,16 @@
+[package]
+name = "autofwd"
+version = "0.1.0"
+edition = "2021"
+description = "Cursor-style auto port forwarding for SSH sessions"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+humantime = "2"
+ratatui = "0.29"
+tokio = { version = "1", features = ["full"] }
