@@ -259,3 +259,34 @@ fn test_port_collision_fallback() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_port_removal_detection() -> Result<()> {
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    let mut autofwd = AutofwdProcess::start(&container)?;
+    autofwd.wait_for_event("ready", Duration::from_secs(10))?;
+
+    // Start a listener
+    container.start_listener(7777)?;
+
+    // Wait for it to be forwarded
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(10))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(7777)
+    );
+
+    // Stop the listener
+    container.stop_listener(7777)?;
+
+    // Should detect removal
+    let event = autofwd.wait_for_event("forward_removed", Duration::from_secs(10))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(7777)
+    );
+
+    Ok(())
+}

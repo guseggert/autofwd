@@ -11,7 +11,8 @@ const CONTAINER_PREFIX: &str = "autofwd-test-";
 pub struct TestContainer {
     container_id: String,
     ssh_port: u16,
-    key_dir: TempDir,
+    /// Kept alive to prevent TempDir from being dropped (deleting keys)
+    _key_dir: TempDir,
     key_path: PathBuf,
 }
 
@@ -104,7 +105,7 @@ impl TestContainer {
         let container = TestContainer {
             container_id,
             ssh_port,
-            key_dir,
+            _key_dir: key_dir,
             key_path,
         };
 
@@ -165,11 +166,13 @@ impl TestContainer {
     }
 
     /// Get the mapped SSH port on the host.
+    #[allow(dead_code)]
     pub fn ssh_port(&self) -> u16 {
         self.ssh_port
     }
 
     /// Get the path to the SSH private key.
+    #[allow(dead_code)]
     pub fn key_path(&self) -> &Path {
         &self.key_path
     }
@@ -223,9 +226,19 @@ impl TestContainer {
 
     /// Stop a TCP listener on the given port inside the container.
     pub fn stop_listener(&self, port: u16) -> Result<()> {
-        // Kill any process listening on the port
-        let cmd = format!("pkill -f 'nc -l -p {}'", port);
-        let _ = self.exec(&cmd); // Ignore errors (process might not exist)
+        // Kill any process listening on the port (pattern matches start_listener)
+        let _ = Command::new("docker")
+            .args([
+                "exec",
+                &self.container_id,
+                "pkill",
+                "-f",
+                &format!("nc -l {}", port),
+            ])
+            .output();
+
+        // Give it a moment to die
+        std::thread::sleep(Duration::from_millis(200));
         Ok(())
     }
 

@@ -69,11 +69,6 @@ impl TuiState {
             let _ = tx.send(event);
         }
     }
-
-    /// Set the event sender for headless mode.
-    pub fn set_event_sender(&mut self, tx: EventSender) {
-        self.event_tx = Some(tx);
-    }
 }
 
 /// Local UI state (not shared with monitor).
