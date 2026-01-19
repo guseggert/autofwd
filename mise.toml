@@ -1,3 +1,33 @@
 [tools]
 cargo = "latest"
 rust = "latest"
+
+[tasks.run]
+description = "Run the CLI"
+run = "cargo run -- {{arg(name='args', var=true)}}"
+
+[tasks.test]
+description = "Run all tests"
+run = """
+docker build -t autofwd-test-ssh tests/docker
+cargo test
+"""
+
+[tasks."test:unit"]
+description = "Run unit tests only"
+run = "cargo test --bins"
+
+[tasks."test:e2e"]
+description = "Run E2E tests (requires Docker)"
+run = """
+docker build -t autofwd-test-ssh tests/docker
+cargo test --test e2e -- --test-threads=1
+"""
+
+[tasks.lint]
+description = "Run lints"
+run = "cargo clippy -- -D warnings"
+
+[tasks.fmt]
+description = "Format code"
+run = "cargo fmt"

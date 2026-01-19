@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::events::Event;
 use crate::ports::{find_free_local_port, PortFilter};
 use crate::proc_net::{parse_proc_net_output, remote_host_for, HostPref};
 use crate::ssh::{
@@ -16,6 +17,7 @@ const END_MARKER: &str = "__AUTOFWD_END__";
 const UID_PREFIX: &str = "__AUTOFWD_UID__:";
 
 /// Generate the remote monitoring script that reads /proc/net/tcp directly.
+/// Only sends LISTEN state entries (state 0A) to minimize data transfer.
 fn remote_monitor_script(interval: Duration) -> String {
     let sleep_secs = interval.as_secs_f64();
 
@@ -33,8 +35,11 @@ fi
 echo "{UID_PREFIX}$(id -u)"
 
 while :; do
-    cat /proc/net/tcp 2>/dev/null || true
-    cat /proc/net/tcp6 2>/dev/null || true
+    # Only send LISTEN state (0A) entries to minimize bandwidth
+    # Format: sl local_address rem_address st ...
+    # State is the 4th field, we want 0A (LISTEN)
+    awk '$4 == "0A" {{ print }}' /proc/net/tcp 2>/dev/null || true
+    awk '$4 == "0A" {{ print }}' /proc/net/tcp6 2>/dev/null || true
     echo "{END_MARKER}"
     sleep {sleep_secs:.3}
 done
@@ -127,6 +132,7 @@ async fn process_snapshot(
                 fwd.forwarded_at = Instant::now();
             }
             tui.push_event(format!("↻ service restarted :{}", remote_port));
+            tui.emit(Event::service_restarted(remote_port));
         }
     }
 
@@ -193,11 +199,47 @@ async fn process_snapshot(
                 } else {
                     tui.push_event(format!("+ forwarded :{} → :{}", remote_port, local_port));
                 }
+                tui.emit(Event::forward_added(remote_port, local_port, remote_host));
             }
             Err(e) => {
                 let mut tui = tui_state.write().await;
                 tui.push_event(format!("✗ forward :{} failed: {}", remote_port, e));
+                tui.emit(Event::error(format!(
+                    "forward :{} failed: {}",
+                    remote_port, e
+                )));
             }
+        }
+    }
+
+    // Detect ports that have disappeared and clean them up
+    let gone_ports: Vec<u16> = state
+        .forwards
+        .keys()
+        .filter(|p| !current_ports.contains(p))
+        .copied()
+        .collect();
+
+    for remote_port in gone_ports {
+        if let Some(info) = state.forwards.remove(&remote_port) {
+            // Cancel the SSH forward
+            let _ = ssh_forward_cancel(ctx, info.local_port, &info.remote_host, remote_port).await;
+
+            // Remove from TUI
+            let mut tui = tui_state.write().await;
+            tui.forwarded.retain(|f| f.remote_port != remote_port);
+
+            // Update status
+            if tui.forwarded.is_empty() {
+                tui.status = "watching...".to_string();
+            } else {
+                let active = tui.forwarded.iter().filter(|f| f.enabled).count();
+                let total = tui.forwarded.len();
+                tui.status = format!("watching ({}/{} active)", active, total);
+            }
+
+            tui.push_event(format!("- removed :{}", remote_port));
+            tui.emit(Event::forward_removed(remote_port));
         }
     }
 
@@ -236,6 +278,7 @@ async fn handle_toggle(
                     fwd.enabled = false;
                 }
                 tui.push_event(format!("○ disabled :{}", port));
+                tui.emit(Event::forward_disabled(port));
 
                 let active = tui.forwarded.iter().filter(|f| f.enabled).count();
                 let total = tui.forwarded.len();
@@ -244,6 +287,7 @@ async fn handle_toggle(
             Err(e) => {
                 let mut tui = tui_state.write().await;
                 tui.push_event(format!("✗ failed to disable :{}: {}", port, e));
+                tui.emit(Event::error(format!("failed to disable :{}: {}", port, e)));
             }
         }
     } else {
@@ -263,6 +307,7 @@ async fn handle_toggle(
                     fwd.enabled = true;
                 }
                 tui.push_event(format!("● enabled :{}", port));
+                tui.emit(Event::forward_enabled(port, local_port));
 
                 let active = tui.forwarded.iter().filter(|f| f.enabled).count();
                 let total = tui.forwarded.len();
@@ -271,6 +316,7 @@ async fn handle_toggle(
             Err(e) => {
                 let mut tui = tui_state.write().await;
                 tui.push_event(format!("✗ failed to enable :{}: {}", port, e));
+                tui.emit(Event::error(format!("failed to enable :{}: {}", port, e)));
             }
         }
     }
@@ -337,6 +383,10 @@ async fn reestablish_forwards(ctx: &SshContext, state: &mut MonitorState, tui_st
             Err(e) => {
                 let mut tui = tui_state.write().await;
                 tui.push_event(format!("✗ restore :{} failed: {}", remote_port, e));
+                tui.emit(Event::error(format!(
+                    "restore :{} failed: {}",
+                    remote_port, e
+                )));
                 // Mark as disabled in TUI
                 if let Some(fwd) = tui
                     .forwarded
@@ -379,12 +429,15 @@ pub async fn run_monitor(
                         let mut tui = tui_state.write().await;
                         tui.status = "reconnecting...".to_string();
                         tui.push_event("! connection lost, reconnecting...".to_string());
+                        tui.emit(Event::connection_lost());
                     }
 
                     // Try to restart the ControlMaster
                     if let Err(e) = ssh_master_start(&ctx).await {
                         let mut tui = tui_state.write().await;
                         tui.push_event(format!("✗ reconnect failed: {}", e));
+                        tui.emit(Event::error(format!("reconnect failed: {}", e)));
+                        tui.emit(Event::reconnecting(reconnect_delay.as_millis() as u64));
 
                         // Exponential backoff
                         tokio::time::sleep(reconnect_delay).await;
@@ -398,12 +451,14 @@ pub async fn run_monitor(
                     {
                         let mut tui = tui_state.write().await;
                         tui.push_event("✓ reconnected".to_string());
+                        tui.emit(Event::reconnected());
                     }
                     continue 'reconnect;
                 }
 
                 let mut tui = tui_state.write().await;
                 tui.push_event(format!("✗ monitor error: {}", e));
+                tui.emit(Event::error(format!("monitor error: {}", e)));
                 tokio::time::sleep(reconnect_delay).await;
                 reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
                 continue 'reconnect;
@@ -445,6 +500,8 @@ pub async fn run_monitor(
                             let mut tui = tui_state.write().await;
                             tui.status = "connection lost...".to_string();
                             tui.push_event("! monitor session ended".to_string());
+                            tui.emit(Event::connection_lost());
+                            tui.emit(Event::reconnecting(reconnect_delay.as_millis() as u64));
                             drop(tui);
                             let _ = child.kill().await;
                             let _ = child.wait().await;
@@ -455,6 +512,8 @@ pub async fn run_monitor(
                         Err(e) => {
                             let mut tui = tui_state.write().await;
                             tui.push_event(format!("! read error: {}", e));
+                            tui.emit(Event::error(format!("read error: {}", e)));
+                            tui.emit(Event::reconnecting(reconnect_delay.as_millis() as u64));
                             drop(tui);
                             let _ = child.kill().await;
                             let _ = child.wait().await;

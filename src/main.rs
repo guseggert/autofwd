@@ -1,3 +1,4 @@
+mod events;
 mod monitor;
 mod ports;
 mod proc_net;
@@ -8,7 +9,9 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
+use crate::events::Event;
 use crate::monitor::run_monitor;
 use crate::ports::PortFilter;
 use crate::ssh::{control_path_for, ssh_master_exit, ssh_master_start, SshContext};
@@ -24,8 +27,8 @@ pub struct Args {
     #[arg(value_name = "TARGET")]
     pub target: String,
 
-    /// Poll interval for scanning remote listening ports
-    #[arg(long, default_value = "1s", value_parser = humantime::parse_duration)]
+    /// Poll interval for scanning remote listening ports (lower = more responsive but more bandwidth)
+    #[arg(long, default_value = "2s", value_parser = humantime::parse_duration)]
     pub interval: Duration,
 
     /// Only forward ports in this allowlist: e.g. "3000,5173,8000-9000".
@@ -37,6 +40,10 @@ pub struct Args {
     /// If the desired local port is taken, try the next N ports
     #[arg(long, default_value_t = 50)]
     pub collision_tries: u16,
+
+    /// Run without TUI, output events as JSON lines (for testing/scripting)
+    #[arg(long)]
+    pub headless: bool,
 
     /// Extra args to pass to ssh (put them after `--`), e.g. -i key -p 2222 -J jump
     #[arg(last = true, value_name = "SSH_ARGS")]
@@ -84,8 +91,22 @@ async fn main() -> Result<()> {
     // Set up cleanup guard - ensures cleanup even on panic
     let _cleanup = CleanupGuard { ctx: ctx.clone() };
 
+    // Create event channel for headless mode
+    let event_tx = if args.headless {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
+        // Spawn task to print events as JSON
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                event.emit();
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
     // Create shared state and command channel
-    let tui_state = new_shared_state();
+    let tui_state = new_shared_state(event_tx);
     let (cmd_tx, cmd_rx) = new_command_channel();
 
     // Spawn monitor task
@@ -108,40 +129,66 @@ async fn main() -> Result<()> {
         })
     };
 
-    // Spawn a task to handle Ctrl+C and SIGTERM by requesting quit confirmation
-    let signal_state = tui_state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    signal_state.write().await.quit_requested = true;
+    if args.headless {
+        // Headless mode: emit ready event and wait for signals
+        tui_state.read().await.emit(Event::ready(&args.target));
+
+        // Wait for Ctrl+C or SIGTERM
+        let signal_state = tui_state.clone();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                #[cfg(unix)]
+                {
+                    let mut term = tokio::signal::unix::signal(
+                        tokio::signal::unix::SignalKind::terminate()
+                    ).unwrap();
+                    term.recv().await
                 }
-                _ = async {
-                    #[cfg(unix)]
-                    {
-                        let mut term = tokio::signal::unix::signal(
-                            tokio::signal::unix::SignalKind::terminate()
-                        ).unwrap();
-                        term.recv().await
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await
+            } => {}
+        }
+
+        // Emit shutdown event
+        signal_state.read().await.emit(Event::shutdown());
+        signal_state.write().await.should_quit = true;
+    } else {
+        // TUI mode: spawn signal handler and run TUI
+        let signal_state = tui_state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        signal_state.write().await.quit_requested = true;
                     }
-                    #[cfg(not(unix))]
-                    std::future::pending::<()>().await
-                } => {
-                    signal_state.write().await.quit_requested = true;
+                    _ = async {
+                        #[cfg(unix)]
+                        {
+                            let mut term = tokio::signal::unix::signal(
+                                tokio::signal::unix::SignalKind::terminate()
+                            ).unwrap();
+                            term.recv().await
+                        }
+                        #[cfg(not(unix))]
+                        std::future::pending::<()>().await
+                    } => {
+                        signal_state.write().await.quit_requested = true;
+                    }
                 }
             }
-        }
-    });
+        });
 
-    // Run TUI (blocks until quit confirmed)
-    let tui_result = run_tui(tui_state.clone(), args.target.clone(), cmd_tx).await;
+        // Run TUI (blocks until quit confirmed)
+        run_tui(tui_state.clone(), args.target.clone(), cmd_tx).await?;
 
-    // Signal monitor to stop
-    tui_state.write().await.should_quit = true;
+        // Signal monitor to stop
+        tui_state.write().await.should_quit = true;
+    }
 
     // Wait for monitor to finish
     let _ = tokio::time::timeout(Duration::from_secs(2), monitor_handle).await;
 
     // Note: CleanupGuard will call ssh_master_exit when dropped
-    tui_result
+    Ok(())
 }

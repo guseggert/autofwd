@@ -1,9 +1,10 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use futures::StreamExt;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table},
@@ -12,6 +13,8 @@ use std::io::{stdout, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
+
+use crate::events::Event as JsonEvent;
 
 const MAX_EVENTS: usize = 5;
 
@@ -31,6 +34,9 @@ pub enum TuiCommand {
     ToggleForward { index: usize },
 }
 
+/// Channel for emitting JSON events in headless mode.
+pub type EventSender = mpsc::UnboundedSender<JsonEvent>;
+
 /// Shared state between the monitor and the TUI.
 #[derive(Debug, Default)]
 pub struct TuiState {
@@ -40,6 +46,9 @@ pub struct TuiState {
     pub quit_requested: bool, // Set by Ctrl+C to trigger confirmation
     pub selected: usize,
     pub events: Vec<String>,
+    /// Optional channel for JSON events (headless mode)
+    #[allow(dead_code)]
+    event_tx: Option<EventSender>,
 }
 
 impl TuiState {
@@ -52,6 +61,18 @@ impl TuiState {
         if self.events.len() > MAX_EVENTS {
             self.events.remove(0);
         }
+    }
+
+    /// Emit a structured event (for headless mode JSON output).
+    pub fn emit(&self, event: JsonEvent) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Set the event sender for headless mode.
+    pub fn set_event_sender(&mut self, tx: EventSender) {
+        self.event_tx = Some(tx);
     }
 }
 
@@ -67,7 +88,7 @@ pub type SharedState = Arc<RwLock<TuiState>>;
 pub type CommandSender = mpsc::Sender<TuiCommand>;
 pub type CommandReceiver = mpsc::Receiver<TuiCommand>;
 
-pub fn new_shared_state() -> SharedState {
+pub fn new_shared_state(event_tx: Option<EventSender>) -> SharedState {
     Arc::new(RwLock::new(TuiState {
         status: "connecting...".to_string(),
         forwarded: Vec::new(),
@@ -75,6 +96,7 @@ pub fn new_shared_state() -> SharedState {
         quit_requested: false,
         selected: 0,
         events: Vec::new(),
+        event_tx,
     }))
 }
 
@@ -325,104 +347,129 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
         show_quit_confirm: false,
     };
 
+    let mut event_stream = EventStream::new();
+
+    // Initial draw
+    {
+        let s = state.read().await;
+        tui.draw(&s, &ui, &target)?;
+    }
+
     loop {
-        // Check if we should quit and draw
+        // Check for quit/quit_requested
         {
-            let mut s = state.write().await;
+            let s = state.read().await;
             if s.should_quit {
                 break;
             }
-            // Check if quit was requested (e.g., from Ctrl+C signal)
             if s.quit_requested {
-                s.quit_requested = false;
+                drop(s);
+                state.write().await.quit_requested = false;
                 ui.show_quit_confirm = true;
+                let s = state.read().await;
+                tui.draw(&s, &ui, &target)?;
             }
-            tui.draw(&s, &ui, &target)?;
         }
 
-        // Poll for keyboard events with a timeout
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    // Handle quit confirmation dialog
-                    if ui.show_quit_confirm {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                state.write().await.should_quit = true;
-                                break;
+        // Wait for: keyboard event OR periodic redraw (for age updates)
+        tokio::select! {
+            // Keyboard input - no polling, just async wait
+            maybe_event = event_stream.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        // Handle quit confirmation dialog
+                        if ui.show_quit_confirm {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    state.write().await.should_quit = true;
+                                    break;
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                    ui.show_quit_confirm = false;
+                                }
+                                _ => {}
                             }
-                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                ui.show_quit_confirm = false;
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
+                        } else if ui.show_help {
+                            // Any key closes help
+                            ui.show_help = false;
+                        } else {
+                            // Normal key handling
+                            let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-                    // Handle help overlay
-                    if ui.show_help {
-                        // Any key closes help
-                        ui.show_help = false;
-                        continue;
-                    }
-
-                    // Normal key handling
-                    // Check for Ctrl+P (up) and Ctrl+N (down) - emacs style
-                    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-                    if is_ctrl {
-                        match key.code {
-                            KeyCode::Char('p') => {
-                                let mut s = state.write().await;
-                                if s.selected > 0 {
-                                    s.selected -= 1;
+                            if is_ctrl {
+                                match key.code {
+                                    KeyCode::Char('p') => {
+                                        let mut s = state.write().await;
+                                        if s.selected > 0 {
+                                            s.selected -= 1;
+                                        }
+                                    }
+                                    KeyCode::Char('n') => {
+                                        let mut s = state.write().await;
+                                        let len = s.forwarded.len();
+                                        if len > 0 && s.selected < len - 1 {
+                                            s.selected += 1;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                                        ui.show_quit_confirm = true;
+                                    }
+                                    KeyCode::Char('?') => {
+                                        ui.show_help = true;
+                                    }
+                                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                                        ui.show_events = !ui.show_events;
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        let mut s = state.write().await;
+                                        if s.selected > 0 {
+                                            s.selected -= 1;
+                                        }
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        let mut s = state.write().await;
+                                        let len = s.forwarded.len();
+                                        if len > 0 && s.selected < len - 1 {
+                                            s.selected += 1;
+                                        }
+                                    }
+                                    KeyCode::Char(' ') => {
+                                        let s = state.read().await;
+                                        if !s.forwarded.is_empty() {
+                                            let _ = cmd_tx
+                                                .send(TuiCommand::ToggleForward { index: s.selected })
+                                                .await;
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
-                            KeyCode::Char('n') => {
-                                let mut s = state.write().await;
-                                let len = s.forwarded.len();
-                                if len > 0 && s.selected < len - 1 {
-                                    s.selected += 1;
-                                }
-                            }
-                            _ => {}
                         }
-                    } else {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                                ui.show_quit_confirm = true;
-                            }
-                            KeyCode::Char('?') => {
-                                ui.show_help = true;
-                            }
-                            KeyCode::Char('e') | KeyCode::Char('E') => {
-                                ui.show_events = !ui.show_events;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                let mut s = state.write().await;
-                                if s.selected > 0 {
-                                    s.selected -= 1;
-                                }
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                let mut s = state.write().await;
-                                let len = s.forwarded.len();
-                                if len > 0 && s.selected < len - 1 {
-                                    s.selected += 1;
-                                }
-                            }
-                            KeyCode::Char(' ') => {
-                                let s = state.read().await;
-                                if !s.forwarded.is_empty() {
-                                    let _ = cmd_tx
-                                        .send(TuiCommand::ToggleForward { index: s.selected })
-                                        .await;
-                                }
-                            }
-                            _ => {}
-                        }
+                        // Redraw after key press
+                        let s = state.read().await;
+                        tui.draw(&s, &ui, &target)?;
                     }
+                    Some(Ok(Event::Resize(_, _))) => {
+                        // Redraw on terminal resize
+                        let s = state.read().await;
+                        tui.draw(&s, &ui, &target)?;
+                    }
+                    Some(Err(_)) | None => {
+                        // Stream ended or error
+                        break;
+                    }
+                    _ => {} // Ignore other events (mouse, etc.)
                 }
+            }
+
+            // Periodic redraw for age column updates (every 10 seconds)
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                let s = state.read().await;
+                tui.draw(&s, &ui, &target)?;
             }
         }
     }
