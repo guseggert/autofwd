@@ -29,9 +29,12 @@ pub async fn ssh_master_start(ctx: &SshContext) -> Result<()> {
         .arg("-M") // ControlMaster mode
         .arg("-N") // No remote command
         .arg("-f") // Background after auth
-        .arg("-o").arg("ControlPersist=yes") // Keep master alive
-        .arg("-o").arg("ServerAliveInterval=5")
-        .arg("-o").arg("ServerAliveCountMax=3")
+        .arg("-o")
+        .arg("ControlPersist=yes") // Keep master alive
+        .arg("-o")
+        .arg("ServerAliveInterval=5")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
         .arg("-S")
         .arg(ctx.control_path.to_string_lossy().to_string())
         .arg(&ctx.target)
@@ -64,7 +67,8 @@ pub async fn ssh_forward_add(
         .args(&ctx.ssh_args)
         .arg("-S")
         .arg(ctx.control_path.to_string_lossy().to_string())
-        .arg("-O").arg("forward")
+        .arg("-O")
+        .arg("forward")
         .arg("-L")
         .arg(&spec)
         .arg(&ctx.target)
@@ -97,7 +101,8 @@ pub async fn ssh_forward_cancel(
         .args(&ctx.ssh_args)
         .arg("-S")
         .arg(ctx.control_path.to_string_lossy().to_string())
-        .arg("-O").arg("cancel")
+        .arg("-O")
+        .arg("cancel")
         .arg("-L")
         .arg(&spec)
         .arg(&ctx.target)

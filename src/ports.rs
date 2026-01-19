@@ -4,17 +4,17 @@ use anyhow::{Context, Result};
 /// These can be overridden with an explicit --allow.
 const DEFAULT_DENY: &[u16] = &[
     // System services
-    22,    // SSH
-    53,    // DNS
-    67,    // DHCP server
-    68,    // DHCP client
-    123,   // NTP
-    137,   // NetBIOS
-    138,   // NetBIOS
-    139,   // NetBIOS
-    445,   // SMB
-    631,   // CUPS (printing)
-    5353,  // mDNS
+    22,   // SSH
+    53,   // DNS
+    67,   // DHCP server
+    68,   // DHCP client
+    123,  // NTP
+    137,  // NetBIOS
+    138,  // NetBIOS
+    139,  // NetBIOS
+    445,  // SMB
+    631,  // CUPS (printing)
+    5353, // mDNS
     // Databases
     1433,  // MSSQL
     1521,  // Oracle
@@ -192,8 +192,8 @@ mod tests {
         assert!(filter.allows(8080));
         assert!(filter.allows(65535));
         // System ports are denied
-        assert!(!filter.allows(22));  // SSH
-        assert!(!filter.allows(53));  // DNS
+        assert!(!filter.allows(22)); // SSH
+        assert!(!filter.allows(53)); // DNS
         assert!(!filter.allows(5353)); // mDNS
     }
 
@@ -201,7 +201,7 @@ mod tests {
     fn test_explicit_allow_overrides_deny() {
         // Explicit allowlist can include normally-denied ports
         let filter = PortFilter::new(Some("22,3000")).unwrap();
-        assert!(filter.allows(22));   // Explicitly allowed
+        assert!(filter.allows(22)); // Explicitly allowed
         assert!(filter.allows(3000)); // Explicitly allowed
         assert!(!filter.allows(8080)); // Not in allowlist
     }

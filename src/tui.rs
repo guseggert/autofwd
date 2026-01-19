@@ -46,7 +46,7 @@ impl TuiState {
     /// Add an event to the log (keeps last MAX_EVENTS).
     pub fn push_event(&mut self, event: String) {
         use chrono::Local;
-        
+
         let timestamp = Local::now().format("%H:%M:%S").to_string();
         self.events.push(format!("{} {}", timestamp, event));
         if self.events.len() > MAX_EVENTS {
@@ -195,7 +195,9 @@ impl Tui {
                 let items: Vec<ListItem> = state
                     .events
                     .iter()
-                    .map(|e| ListItem::new(format!(" {}", e)).style(Style::default().fg(Color::Cyan)))
+                    .map(|e| {
+                        ListItem::new(format!(" {}", e)).style(Style::default().fg(Color::Cyan))
+                    })
                     .collect();
                 let events_list = List::new(items)
                     .block(Block::default().borders(Borders::ALL).title(" Events "));
@@ -203,7 +205,11 @@ impl Tui {
             }
 
             // Footer
-            let events_indicator = if ui.show_events { "e:events ✓" } else { "e:events" };
+            let events_indicator = if ui.show_events {
+                "e:events ✓"
+            } else {
+                "e:events"
+            };
             let footer = Paragraph::new(format!(
                 " ↑/↓ navigate • space toggle • {} • ?:help • q quit",
                 events_indicator
@@ -363,7 +369,7 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
                     // Normal key handling
                     // Check for Ctrl+P (up) and Ctrl+N (down) - emacs style
                     let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    
+
                     if is_ctrl {
                         match key.code {
                             KeyCode::Char('p') => {
@@ -408,7 +414,9 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
                             KeyCode::Char(' ') => {
                                 let s = state.read().await;
                                 if !s.forwarded.is_empty() {
-                                    let _ = cmd_tx.send(TuiCommand::ToggleForward { index: s.selected }).await;
+                                    let _ = cmd_tx
+                                        .send(TuiCommand::ToggleForward { index: s.selected })
+                                        .await;
                                 }
                             }
                             _ => {}
@@ -421,5 +429,3 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
 
     Ok(())
 }
-
-

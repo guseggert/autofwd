@@ -7,7 +7,9 @@ use tokio::process::Command;
 
 use crate::ports::{find_free_local_port, PortFilter};
 use crate::proc_net::{parse_proc_net_output, remote_host_for, HostPref};
-use crate::ssh::{ssh_forward_add, ssh_forward_cancel, ssh_master_check, ssh_master_start, SshContext};
+use crate::ssh::{
+    ssh_forward_add, ssh_forward_cancel, ssh_master_check, ssh_master_start, SshContext,
+};
 use crate::tui::{CommandReceiver, ForwardedPort, SharedState, TuiCommand};
 
 const END_MARKER: &str = "__AUTOFWD_END__";
@@ -117,7 +119,11 @@ async fn process_snapshot(
         if was_gone && is_back {
             // Port restarted - forward should still be active via ControlMaster
             let mut tui = tui_state.write().await;
-            if let Some(fwd) = tui.forwarded.iter_mut().find(|f| f.remote_port == remote_port) {
+            if let Some(fwd) = tui
+                .forwarded
+                .iter_mut()
+                .find(|f| f.remote_port == remote_port)
+            {
                 fwd.forwarded_at = Instant::now();
             }
             tui.push_event(format!("↻ service restarted :{}", remote_port));
@@ -134,7 +140,11 @@ async fn process_snapshot(
         // Skip if user has disabled this port (it's in TUI state but not enabled)
         {
             let tui = tui_state.read().await;
-            if tui.forwarded.iter().any(|f| f.remote_port == remote_port && !f.enabled) {
+            if tui
+                .forwarded
+                .iter()
+                .any(|f| f.remote_port == remote_port && !f.enabled)
+            {
                 continue;
             }
         }
@@ -145,7 +155,11 @@ async fn process_snapshot(
         }
 
         // Determine remote host based on address family
-        let pref = state.host_prefs.get(&remote_port).copied().unwrap_or_default();
+        let pref = state
+            .host_prefs
+            .get(&remote_port)
+            .copied()
+            .unwrap_or_default();
         let remote_host = remote_host_for(&pref);
 
         // Find a free local port
@@ -156,10 +170,13 @@ async fn process_snapshot(
         // Attempt to forward via ControlMaster
         match ssh_forward_add(ctx, local_port, remote_host, remote_port).await {
             Ok(()) => {
-                state.forwards.insert(remote_port, ForwardInfo {
-                    local_port,
-                    remote_host: remote_host.to_string(),
-                });
+                state.forwards.insert(
+                    remote_port,
+                    ForwardInfo {
+                        local_port,
+                        remote_host: remote_host.to_string(),
+                    },
+                );
 
                 // Update TUI state
                 let mut tui = tui_state.write().await;
@@ -201,7 +218,12 @@ async fn handle_toggle(
             return;
         }
         let fwd = &tui.forwarded[index];
-        (fwd.remote_port, fwd.local_port, fwd.remote_host.clone(), fwd.enabled)
+        (
+            fwd.remote_port,
+            fwd.local_port,
+            fwd.remote_host.clone(),
+            fwd.enabled,
+        )
     };
 
     if is_enabled {
@@ -214,7 +236,7 @@ async fn handle_toggle(
                     fwd.enabled = false;
                 }
                 tui.push_event(format!("○ disabled :{}", port));
-                
+
                 let active = tui.forwarded.iter().filter(|f| f.enabled).count();
                 let total = tui.forwarded.len();
                 tui.status = format!("watching ({}/{} active)", active, total);
@@ -228,17 +250,20 @@ async fn handle_toggle(
         // Enable: add the forward via ControlMaster
         match ssh_forward_add(ctx, local_port, &remote_host, port).await {
             Ok(()) => {
-                state.forwards.insert(port, ForwardInfo {
-                    local_port,
-                    remote_host,
-                });
-                
+                state.forwards.insert(
+                    port,
+                    ForwardInfo {
+                        local_port,
+                        remote_host,
+                    },
+                );
+
                 let mut tui = tui_state.write().await;
                 if let Some(fwd) = tui.forwarded.iter_mut().find(|f| f.remote_port == port) {
                     fwd.enabled = true;
                 }
                 tui.push_event(format!("● enabled :{}", port));
-                
+
                 let active = tui.forwarded.iter().filter(|f| f.enabled).count();
                 let total = tui.forwarded.len();
                 tui.status = format!("watching ({}/{} active)", active, total);
@@ -255,7 +280,10 @@ async fn handle_toggle(
 async fn spawn_monitor_session(
     ctx: &SshContext,
     interval: Duration,
-) -> Result<(tokio::process::Child, tokio::io::Lines<BufReader<tokio::process::ChildStdout>>)> {
+) -> Result<(
+    tokio::process::Child,
+    tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+)> {
     let script = remote_monitor_script(interval);
 
     let mut child = Command::new("ssh")
@@ -294,20 +322,27 @@ async fn spawn_monitor_session(
 /// Re-establish all active forwards after a reconnection.
 async fn reestablish_forwards(ctx: &SshContext, state: &mut MonitorState, tui_state: &SharedState) {
     let forwards_to_restore: Vec<_> = state.forwards.drain().collect();
-    
+
     for (remote_port, info) in forwards_to_restore {
         match ssh_forward_add(ctx, info.local_port, &info.remote_host, remote_port).await {
             Ok(()) => {
-                state.forwards.insert(remote_port, ForwardInfo {
-                    local_port: info.local_port,
-                    remote_host: info.remote_host,
-                });
+                state.forwards.insert(
+                    remote_port,
+                    ForwardInfo {
+                        local_port: info.local_port,
+                        remote_host: info.remote_host,
+                    },
+                );
             }
             Err(e) => {
                 let mut tui = tui_state.write().await;
                 tui.push_event(format!("✗ restore :{} failed: {}", remote_port, e));
                 // Mark as disabled in TUI
-                if let Some(fwd) = tui.forwarded.iter_mut().find(|f| f.remote_port == remote_port) {
+                if let Some(fwd) = tui
+                    .forwarded
+                    .iter_mut()
+                    .find(|f| f.remote_port == remote_port)
+                {
                     fwd.enabled = false;
                 }
             }
@@ -336,10 +371,7 @@ pub async fn run_monitor(
 
         // Spawn monitor session
         let (mut child, mut lines) = match spawn_monitor_session(&ctx, interval).await {
-            Ok(result) => {
-                reconnect_delay = Duration::from_secs(1); // Reset delay on success
-                result
-            }
+            Ok(result) => result,
             Err(e) => {
                 // Check if ControlMaster is dead
                 if !ssh_master_check(&ctx).await {
@@ -353,7 +385,7 @@ pub async fn run_monitor(
                     if let Err(e) = ssh_master_start(&ctx).await {
                         let mut tui = tui_state.write().await;
                         tui.push_event(format!("✗ reconnect failed: {}", e));
-                        
+
                         // Exponential backoff
                         tokio::time::sleep(reconnect_delay).await;
                         reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
@@ -362,7 +394,7 @@ pub async fn run_monitor(
 
                     // Re-establish forwards
                     reestablish_forwards(&ctx, &mut state, &tui_state).await;
-                    
+
                     {
                         let mut tui = tui_state.write().await;
                         tui.push_event("✓ reconnected".to_string());
@@ -398,6 +430,8 @@ pub async fn run_monitor(
                             let trimmed = line.trim();
                             if trimmed == END_MARKER {
                                 process_snapshot(&mut state, &ctx, &filter, collision_tries, &tui_state).await;
+                                // Reset backoff only after successful data - proves stable connection
+                                reconnect_delay = Duration::from_secs(1);
                             } else if let Some(uid_str) = trimmed.strip_prefix(UID_PREFIX) {
                                 if let Ok(uid) = uid_str.parse::<u32>() {
                                     state.user_uid = Some(uid);
@@ -411,17 +445,21 @@ pub async fn run_monitor(
                             let mut tui = tui_state.write().await;
                             tui.status = "connection lost...".to_string();
                             tui.push_event("! monitor session ended".to_string());
+                            drop(tui);
                             let _ = child.kill().await;
                             let _ = child.wait().await;
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::time::sleep(reconnect_delay).await;
+                            reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
                             continue 'reconnect;
                         }
                         Err(e) => {
                             let mut tui = tui_state.write().await;
                             tui.push_event(format!("! read error: {}", e));
+                            drop(tui);
                             let _ = child.kill().await;
                             let _ = child.wait().await;
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::time::sleep(reconnect_delay).await;
+                            reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
                             continue 'reconnect;
                         }
                     }

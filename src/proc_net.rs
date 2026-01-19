@@ -124,7 +124,7 @@ pub fn parse_proc_tcp_line(line: &str, is_ipv6: bool) -> Option<TcpEntry> {
 
     let local_port = u16::from_str_radix(port_hex, 16).ok()?;
     let state_val = u8::from_str_radix(parts[3], 16).ok()?;
-    
+
     // UID is at index 7 (after tx_queue rx_queue tr tm->when retrnsmt)
     // But the format varies - tx_queue:rx_queue is one field, tr tm->when is two
     // Actually: sl(0) local(1) rem(2) st(3) tx:rx(4) tr:tm(5) retrnsmt(6) uid(7)
@@ -250,11 +250,11 @@ mod tests {
         // Filter to UID 1000 - only get 443
         let result = parse_proc_net_output(output, Some(1000));
         assert!(!result.contains_key(&3306)); // owned by root (0)
-        assert!(result.contains_key(&443));   // owned by UID 1000
+        assert!(result.contains_key(&443)); // owned by UID 1000
 
         // Filter to UID 0 - only get 3306
         let result = parse_proc_net_output(output, Some(0));
-        assert!(result.contains_key(&3306));  // owned by root (0)
-        assert!(!result.contains_key(&443));  // owned by UID 1000
+        assert!(result.contains_key(&3306)); // owned by root (0)
+        assert!(!result.contains_key(&443)); // owned by UID 1000
     }
 }
