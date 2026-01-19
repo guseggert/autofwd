@@ -297,7 +297,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
 
 /// Render the quit confirmation dialog.
 fn render_quit_confirm(frame: &mut Frame, area: Rect) {
-    let lines = vec![
+    let lines = [
         "",
         "  Are you sure you want to quit?",
         "",
