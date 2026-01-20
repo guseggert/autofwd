@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
 
-/// Ephemeral/high port range (32768-65535).
+/// Ephemeral/high ports start here (32768+).
 /// These are used for outgoing connections and rarely need forwarding.
 const EPHEMERAL_START: u16 = 32768;
-const EPHEMERAL_END: u16 = 65535;
 
 /// Ports that are never forwarded by default (system/infrastructure services).
 /// These can be overridden with an explicit --allow.
@@ -78,10 +77,8 @@ impl PortFilter {
         match &self.allow {
             // Explicit allowlist: only allow ports in the list
             Some(ranges) => ranges.iter().any(|r| r.contains(port)),
-            // No allowlist: allow everything except default deny and ephemeral range
-            None => {
-                !DEFAULT_DENY.contains(&port) && !(port >= EPHEMERAL_START && port <= EPHEMERAL_END)
-            }
+            // No allowlist: allow everything except default deny and ephemeral/high ports
+            None => !DEFAULT_DENY.contains(&port) && port < EPHEMERAL_START,
         }
     }
 }
