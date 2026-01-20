@@ -1,5 +1,10 @@
 use anyhow::{Context, Result};
 
+/// Ephemeral/high port range (32768-65535).
+/// These are used for outgoing connections and rarely need forwarding.
+const EPHEMERAL_START: u16 = 32768;
+const EPHEMERAL_END: u16 = 65535;
+
 /// Ports that are never forwarded by default (system/infrastructure services).
 /// These can be overridden with an explicit --allow.
 const DEFAULT_DENY: &[u16] = &[
@@ -73,8 +78,10 @@ impl PortFilter {
         match &self.allow {
             // Explicit allowlist: only allow ports in the list
             Some(ranges) => ranges.iter().any(|r| r.contains(port)),
-            // No allowlist: allow everything except default deny
-            None => !DEFAULT_DENY.contains(&port),
+            // No allowlist: allow everything except default deny and ephemeral range
+            None => {
+                !DEFAULT_DENY.contains(&port) && !(port >= EPHEMERAL_START && port <= EPHEMERAL_END)
+            }
         }
     }
 }
@@ -190,11 +197,16 @@ mod tests {
         // Regular ports are allowed
         assert!(filter.allows(3000));
         assert!(filter.allows(8080));
-        assert!(filter.allows(65535));
-        // System ports are denied
+        assert!(filter.allows(31000)); // Just below ephemeral range
+                                       // System ports are denied
         assert!(!filter.allows(22)); // SSH
         assert!(!filter.allows(53)); // DNS
         assert!(!filter.allows(5353)); // mDNS
+                                       // Ephemeral/high ports are denied (32768-65535)
+        assert!(!filter.allows(32768)); // Start of ephemeral range
+        assert!(!filter.allows(50000)); // Middle of range
+        assert!(!filter.allows(61052)); // High port
+        assert!(!filter.allows(65535)); // Max port
     }
 
     #[test]
