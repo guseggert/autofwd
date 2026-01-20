@@ -1,6 +1,7 @@
 mod events;
 mod monitor;
 mod ports;
+mod probe;
 mod proc_net;
 mod ssh;
 mod tui;
@@ -44,6 +45,10 @@ pub struct Args {
     /// Run without TUI, output events as JSON lines (for testing/scripting)
     #[arg(long)]
     pub headless: bool,
+
+    /// Assume all forwarded ports are HTTP (skip protocol detection)
+    #[arg(long)]
+    pub assume_http: bool,
 
     /// Extra args to pass to ssh (put them after `--`), e.g. -i key -p 2222 -J jump
     #[arg(last = true, value_name = "SSH_ARGS")]
@@ -116,12 +121,14 @@ async fn main() -> Result<()> {
         let monitor_state = tui_state.clone();
         let interval = args.interval;
         let collision_tries = args.collision_tries;
+        let assume_http = args.assume_http;
         tokio::spawn(async move {
             let _ = run_monitor(
                 monitor_ctx,
                 monitor_filter,
                 interval,
                 collision_tries,
+                assume_http,
                 monitor_state,
                 cmd_rx,
             )

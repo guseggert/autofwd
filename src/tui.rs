@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
 use crate::events::Event as JsonEvent;
+use crate::probe::Protocol;
 
 const MAX_EVENTS: usize = 5;
 
@@ -26,6 +27,7 @@ pub struct ForwardedPort {
     pub remote_host: String,
     pub forwarded_at: Instant,
     pub enabled: bool,
+    pub protocol: Protocol,
 }
 
 /// Commands from TUI to monitor for toggling forwards.
@@ -181,7 +183,7 @@ impl Tui {
                         Cell::from(format!(":{}", fwd.remote_port)),
                         Cell::from(format!(":{}", fwd.local_port)),
                         Cell::from(if fwd.enabled {
-                            format!("localhost:{}", fwd.local_port)
+                            fwd.protocol.format_address(fwd.local_port)
                         } else {
                             "(disabled)".to_string()
                         }),

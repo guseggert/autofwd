@@ -7,6 +7,7 @@ use tokio::process::Command;
 
 use crate::events::Event;
 use crate::ports::{find_free_local_port, PortFilter};
+use crate::probe::{detect_protocol, Protocol};
 use crate::proc_net::{parse_proc_net_output, remote_host_for, HostPref};
 use crate::ssh::{
     ssh_forward_add, ssh_forward_cancel, ssh_master_check, ssh_master_start, SshContext,
@@ -106,6 +107,7 @@ async fn process_snapshot(
     ctx: &SshContext,
     filter: &PortFilter,
     collision_tries: u16,
+    assume_http: bool,
     tui_state: &SharedState,
 ) {
     // Parse the accumulated output
@@ -138,16 +140,43 @@ async fn process_snapshot(
 
         if was_gone && is_back {
             // Port restarted - forward should still be active via ControlMaster
-            let mut tui = tui_state.write().await;
-            if let Some(fwd) = tui
-                .forwarded
-                .iter_mut()
-                .find(|f| f.remote_port == remote_port)
-            {
-                fwd.forwarded_at = Instant::now();
+            let local_port = {
+                let mut tui = tui_state.write().await;
+                let local_port = if let Some(fwd) = tui
+                    .forwarded
+                    .iter_mut()
+                    .find(|f| f.remote_port == remote_port)
+                {
+                    fwd.forwarded_at = Instant::now();
+                    fwd.protocol = Protocol::Unknown; // Reset for re-probing
+                    Some(fwd.local_port)
+                } else {
+                    None
+                };
+                tui.push_event(format!("↻ service restarted :{}", remote_port));
+                tui.emit(Event::service_restarted(remote_port));
+                local_port
+            };
+
+            // Re-probe protocol on restart if not assume_http
+            if !assume_http {
+                if let Some(local_port) = local_port {
+                    let tui_state_clone = tui_state.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        let detected = detect_protocol(local_port).await;
+                        let mut tui = tui_state_clone.write().await;
+                        if let Some(fwd) = tui
+                            .forwarded
+                            .iter_mut()
+                            .find(|f| f.local_port == local_port && f.enabled)
+                        {
+                            fwd.protocol = detected;
+                        }
+                        tui.emit(Event::protocol_detected(local_port, detected.as_str()));
+                    });
+                }
             }
-            tui.push_event(format!("↻ service restarted :{}", remote_port));
-            tui.emit(Event::service_restarted(remote_port));
         }
     }
 
@@ -199,6 +228,13 @@ async fn process_snapshot(
                     },
                 );
 
+                // Determine initial protocol
+                let protocol = if assume_http {
+                    Protocol::Http
+                } else {
+                    Protocol::Unknown
+                };
+
                 // Update TUI state
                 let mut tui = tui_state.write().await;
                 tui.forwarded.push(ForwardedPort {
@@ -207,6 +243,7 @@ async fn process_snapshot(
                     remote_host: remote_host.to_string(),
                     forwarded_at: Instant::now(),
                     enabled: true,
+                    protocol,
                 });
                 tui.status = format!("watching ({} forwarded)", tui.forwarded.len());
                 if local_port == remote_port {
@@ -214,7 +251,46 @@ async fn process_snapshot(
                 } else {
                     tui.push_event(format!("+ forwarded :{} → :{}", remote_port, local_port));
                 }
-                tui.emit(Event::forward_added(remote_port, local_port, remote_host));
+                tui.emit(Event::forward_added(
+                    remote_port,
+                    local_port,
+                    remote_host,
+                    protocol.as_str(),
+                ));
+                drop(tui);
+
+                // Spawn protocol detection task if not assume_http
+                if !assume_http {
+                    let tui_state_clone = tui_state.clone();
+                    tokio::spawn(async move {
+                        // Delay to let the forward establish and service respond
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+
+                        // Try detection multiple times with increasing delays
+                        let mut detected = Protocol::Unknown;
+                        for attempt in 0..3 {
+                            if attempt > 0 {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                            detected = detect_protocol(local_port).await;
+                            if detected != Protocol::Unknown {
+                                break;
+                            }
+                        }
+
+                        // Update the ForwardedPort with detected protocol
+                        let mut tui = tui_state_clone.write().await;
+                        if let Some(fwd) = tui
+                            .forwarded
+                            .iter_mut()
+                            .find(|f| f.local_port == local_port && f.enabled)
+                        {
+                            fwd.protocol = detected;
+                        }
+                        // Emit updated event with detected protocol
+                        tui.emit(Event::protocol_detected(local_port, detected.as_str()));
+                    });
+                }
             }
             Err(e) => {
                 let mut tui = tui_state.write().await;
@@ -421,6 +497,7 @@ pub async fn run_monitor(
     filter: PortFilter,
     interval: Duration,
     collision_tries: u16,
+    assume_http: bool,
     tui_state: SharedState,
     mut cmd_rx: CommandReceiver,
 ) -> Result<()> {
@@ -498,7 +575,7 @@ pub async fn run_monitor(
                         Ok(Some(line)) => {
                             let trimmed = line.trim();
                             if trimmed == END_MARKER {
-                                process_snapshot(&mut state, &ctx, &filter, collision_tries, &tui_state).await;
+                                process_snapshot(&mut state, &ctx, &filter, collision_tries, assume_http, &tui_state).await;
                                 // Reset backoff only after successful data - proves stable connection
                                 reconnect_delay = Duration::from_secs(1);
                             } else if trimmed == HEARTBEAT_MARKER {

@@ -8,7 +8,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use support::{ensure_image_built, TestContainer};
+use support::{
+    ensure_image_built, ensure_service_images_pulled, ContainerType, ServiceContainer,
+    TestContainer, TestNetwork,
+};
 
 /// Helper to run autofwd in headless mode and capture JSON events.
 struct AutofwdProcess {
@@ -19,11 +22,18 @@ struct AutofwdProcess {
 
 impl AutofwdProcess {
     fn start(container: &TestContainer) -> Result<Self> {
+        Self::start_with_args(container, &[])
+    }
+
+    fn start_with_args(container: &TestContainer, extra_args: &[&str]) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_autofwd"));
-        cmd.arg("--headless")
-            .arg("--interval")
-            .arg("500ms")
-            .arg(container.ssh_target())
+        cmd.arg("--headless").arg("--interval").arg("500ms");
+
+        for arg in extra_args {
+            cmd.arg(arg);
+        }
+
+        cmd.arg(container.ssh_target())
             .arg("--")
             .args(container.ssh_args())
             .stdin(Stdio::null())
@@ -287,6 +297,160 @@ fn test_port_removal_detection() -> Result<()> {
         event.get("remote_port").and_then(|p| p.as_u64()),
         Some(7777)
     );
+
+    Ok(())
+}
+
+// ============================================================================
+// Protocol Detection Tests
+// ============================================================================
+
+#[test]
+fn test_protocol_detection_http() -> Result<()> {
+    ensure_image_built()?;
+    ensure_service_images_pulled()?;
+
+    // Create isolated network
+    let network = TestNetwork::new()?;
+
+    // Start nginx container
+    let nginx = ServiceContainer::start(ContainerType::Http, &network)?;
+
+    // Start SSH container on same network
+    let ssh = TestContainer::start_on_network(&network)?;
+
+    // Set up port forwarder in SSH container to nginx
+    ssh.start_forwarder(8080, nginx.hostname(), nginx.port())?;
+
+    // Start autofwd
+    let mut autofwd = AutofwdProcess::start(&ssh)?;
+    autofwd.wait_for_event("ready", Duration::from_secs(10))?;
+
+    // Wait for forward_added
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(15))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(8080)
+    );
+
+    // Wait for protocol detection
+    let event = autofwd.wait_for_event("protocol_detected", Duration::from_secs(10))?;
+    assert_eq!(event.get("protocol").and_then(|p| p.as_str()), Some("http"));
+
+    Ok(())
+}
+
+#[test]
+fn test_protocol_detection_redis() -> Result<()> {
+    ensure_image_built()?;
+    ensure_service_images_pulled()?;
+
+    let network = TestNetwork::new()?;
+    let redis = ServiceContainer::start(ContainerType::Redis, &network)?;
+    let ssh = TestContainer::start_on_network(&network)?;
+
+    // Forward redis port
+    ssh.start_forwarder(6379, redis.hostname(), redis.port())?;
+
+    // Start autofwd with --allow to override default deny
+    let mut autofwd = AutofwdProcess::start_with_args(&ssh, &["--allow", "6379"])?;
+    autofwd.wait_for_event("ready", Duration::from_secs(10))?;
+
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(15))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(6379)
+    );
+
+    let event = autofwd.wait_for_event("protocol_detected", Duration::from_secs(10))?;
+    assert_eq!(
+        event.get("protocol").and_then(|p| p.as_str()),
+        Some("redis")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_protocol_detection_postgresql() -> Result<()> {
+    ensure_image_built()?;
+    ensure_service_images_pulled()?;
+
+    let network = TestNetwork::new()?;
+    let postgres = ServiceContainer::start(ContainerType::PostgreSql, &network)?;
+    let ssh = TestContainer::start_on_network(&network)?;
+
+    ssh.start_forwarder(5432, postgres.hostname(), postgres.port())?;
+
+    let mut autofwd = AutofwdProcess::start_with_args(&ssh, &["--allow", "5432"])?;
+    autofwd.wait_for_event("ready", Duration::from_secs(10))?;
+
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(15))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(5432)
+    );
+
+    let event = autofwd.wait_for_event("protocol_detected", Duration::from_secs(10))?;
+    assert_eq!(
+        event.get("protocol").and_then(|p| p.as_str()),
+        Some("postgresql")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_protocol_detection_mariadb() -> Result<()> {
+    ensure_image_built()?;
+    ensure_service_images_pulled()?;
+
+    let network = TestNetwork::new()?;
+    let mariadb = ServiceContainer::start(ContainerType::MariaDb, &network)?;
+    let ssh = TestContainer::start_on_network(&network)?;
+
+    ssh.start_forwarder(3306, mariadb.hostname(), mariadb.port())?;
+
+    let mut autofwd = AutofwdProcess::start_with_args(&ssh, &["--allow", "3306"])?;
+    autofwd.wait_for_event("ready", Duration::from_secs(10))?;
+
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(15))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(3306)
+    );
+
+    let event = autofwd.wait_for_event("protocol_detected", Duration::from_secs(10))?;
+    assert_eq!(
+        event.get("protocol").and_then(|p| p.as_str()),
+        Some("mysql")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_assume_http_flag() -> Result<()> {
+    ensure_image_built()?;
+    ensure_service_images_pulled()?;
+
+    let network = TestNetwork::new()?;
+    let redis = ServiceContainer::start(ContainerType::Redis, &network)?;
+    let ssh = TestContainer::start_on_network(&network)?;
+
+    ssh.start_forwarder(6379, redis.hostname(), redis.port())?;
+
+    // Use --assume-http flag - should skip detection and assume HTTP
+    let mut autofwd = AutofwdProcess::start_with_args(&ssh, &["--allow", "6379", "--assume-http"])?;
+    autofwd.wait_for_event("ready", Duration::from_secs(10))?;
+
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(15))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(6379)
+    );
+    // With --assume-http, protocol should be "http" even for redis
+    assert_eq!(event.get("protocol").and_then(|p| p.as_str()), Some("http"));
 
     Ok(())
 }

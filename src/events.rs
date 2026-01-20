@@ -11,6 +11,13 @@ pub enum Event {
         remote_port: u16,
         local_port: u16,
         remote_host: String,
+        protocol: String,
+    },
+    /// Protocol was detected for a forwarded port
+    ProtocolDetected {
+        ts: DateTime<Utc>,
+        local_port: u16,
+        protocol: String,
     },
     /// A port forward was removed (service stopped)
     ForwardRemoved { ts: DateTime<Utc>, remote_port: u16 },
@@ -39,12 +46,26 @@ pub enum Event {
 }
 
 impl Event {
-    pub fn forward_added(remote_port: u16, local_port: u16, remote_host: &str) -> Self {
+    pub fn forward_added(
+        remote_port: u16,
+        local_port: u16,
+        remote_host: &str,
+        protocol: &str,
+    ) -> Self {
         Event::ForwardAdded {
             ts: Utc::now(),
             remote_port,
             local_port,
             remote_host: remote_host.to_string(),
+            protocol: protocol.to_string(),
+        }
+    }
+
+    pub fn protocol_detected(local_port: u16, protocol: &str) -> Self {
+        Event::ProtocolDetected {
+            ts: Utc::now(),
+            local_port,
+            protocol: protocol.to_string(),
         }
     }
 
