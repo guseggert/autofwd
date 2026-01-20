@@ -40,9 +40,12 @@ Arguments:
   [SSH_ARGS]...  Extra args to pass to ssh (after --), e.g. -i key -p 2222
 
 Options:
-      --interval <INTERVAL>          Poll interval for scanning [default: 1s]
+      --interval <INTERVAL>          Poll interval for scanning [default: 200ms]
       --allow <ALLOW>                Only forward ports in this allowlist, e.g. "3000,5173,8000-9000"
       --collision-tries <N>          If local port is taken, try next N ports [default: 50]
+
+By default, system ports (SSH, DNS, databases, etc.) and high ports (32768-65535) are excluded.
+Use --allow to override and forward specific ports.
   -h, --help                         Print help
 ```
 
@@ -82,7 +85,7 @@ autofwd myserver -- -i ~/.ssh/mykey -p 2222
 ## How it works
 
 1. Establishes an SSH ControlMaster connection to the remote host
-2. Runs a monitoring script that periodically reads `/proc/net/tcp` and `/proc/net/tcp6`
+2. Runs a monitoring script that reads `/proc/net/tcp` and `/proc/net/tcp6` with server-side diffing (only sends data when ports change)
 3. Parses the output to detect listening ports owned by your user
 4. Uses SSH's `-O forward` to dynamically add port forwards through the ControlMaster
 5. Displays everything in a terminal UI
