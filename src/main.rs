@@ -27,8 +27,8 @@ pub struct Args {
     #[arg(value_name = "TARGET")]
     pub target: String,
 
-    /// Poll interval for scanning remote listening ports (lower = more responsive but more bandwidth)
-    #[arg(long, default_value = "2s", value_parser = humantime::parse_duration)]
+    /// Poll interval for checking remote ports (lower = faster detection, slightly more CPU on remote)
+    #[arg(long, default_value = "200ms", value_parser = humantime::parse_duration)]
     pub interval: Duration,
 
     /// Only forward ports in this allowlist: e.g. "3000,5173,8000-9000".

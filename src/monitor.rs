@@ -14,12 +14,15 @@ use crate::ssh::{
 use crate::tui::{CommandReceiver, ForwardedPort, SharedState, TuiCommand};
 
 const END_MARKER: &str = "__AUTOFWD_END__";
-const UID_PREFIX: &str = "__AUTOFWD_UID__:";
+const HEARTBEAT_MARKER: &str = "__AUTOFWD_HEARTBEAT__";
 
 /// Generate the remote monitoring script that reads /proc/net/tcp directly.
-/// Only sends LISTEN state entries (state 0A) to minimize data transfer.
+/// Uses server-side diffing: only sends data when listening ports change.
+/// This provides faster reaction time with lower bandwidth usage.
 fn remote_monitor_script(interval: Duration) -> String {
     let sleep_secs = interval.as_secs_f64();
+    // Send heartbeat every ~5 seconds to confirm connection is alive
+    let heartbeat_threshold = (5.0 / sleep_secs).ceil() as u32;
 
     format!(
         r#"
@@ -31,21 +34,36 @@ if [ ! -f /proc/net/tcp ]; then
     exit 2
 fi
 
-# Output our UID first so client can filter by user
-echo "{UID_PREFIX}$(id -u)"
+prev=""
+heartbeat=0
 
 while :; do
-    # Only send LISTEN state (0A) entries to minimize bandwidth
-    # Format: sl local_address rem_address st ...
-    # State is the 4th field, we want 0A (LISTEN)
-    awk '$4 == "0A" {{ print }}' /proc/net/tcp 2>/dev/null || true
-    awk '$4 == "0A" {{ print }}' /proc/net/tcp6 2>/dev/null || true
-    echo "{END_MARKER}"
+    # Get compact representation of current LISTEN sockets for comparison
+    # Format: local_address (hex addr:port) - sufficient to detect changes
+    curr=$(awk '$4 == "0A" {{ print $2 }}' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort)
+    
+    if [ "$curr" != "$prev" ]; then
+        # State changed - send full snapshot with fflush() for immediate delivery
+        awk '$4 == "0A" {{ print; fflush() }}' /proc/net/tcp 2>/dev/null || true
+        awk '$4 == "0A" {{ print; fflush() }}' /proc/net/tcp6 2>/dev/null || true
+        echo "{END_MARKER}"
+        prev="$curr"
+        heartbeat=0
+    else
+        # No change - send periodic heartbeat to confirm connection is alive
+        heartbeat=$((heartbeat + 1))
+        if [ $heartbeat -ge {heartbeat_threshold} ]; then
+            echo "{HEARTBEAT_MARKER}"
+            heartbeat=0
+        fi
+    fi
+    
     sleep {sleep_secs:.3}
 done
 "#,
         END_MARKER = END_MARKER,
-        UID_PREFIX = UID_PREFIX,
+        HEARTBEAT_MARKER = HEARTBEAT_MARKER,
+        heartbeat_threshold = heartbeat_threshold,
         sleep_secs = sleep_secs
     )
 }
@@ -66,8 +84,6 @@ struct MonitorState {
     snapshot_lines: Vec<String>,
     /// Whether we've done the first scan.
     initialized: bool,
-    /// The remote user's UID (for filtering).
-    user_uid: Option<u32>,
     /// Ports seen in the previous snapshot (to detect restarts).
     last_seen: HashSet<u16>,
 }
@@ -79,7 +95,6 @@ impl MonitorState {
             host_prefs: HashMap::new(),
             snapshot_lines: Vec::new(),
             initialized: false,
-            user_uid: None,
             last_seen: HashSet::new(),
         }
     }
@@ -97,8 +112,8 @@ async fn process_snapshot(
     let output = state.snapshot_lines.join("\n");
     state.snapshot_lines.clear();
 
-    // Filter by user UID to only see ports owned by our user
-    let snapshot = parse_proc_net_output(&output, state.user_uid);
+    // Parse all listening ports (no UID filtering - Docker containers run as root)
+    let snapshot = parse_proc_net_output(&output, None);
 
     // Update host preferences
     for (port, pref) in &snapshot {
@@ -467,7 +482,6 @@ pub async fn run_monitor(
 
         // Reset monitor state for new session (keep forwards info)
         state.snapshot_lines.clear();
-        state.user_uid = None;
         state.initialized = false;
 
         // Inner loop processes the monitor output
@@ -487,10 +501,9 @@ pub async fn run_monitor(
                                 process_snapshot(&mut state, &ctx, &filter, collision_tries, &tui_state).await;
                                 // Reset backoff only after successful data - proves stable connection
                                 reconnect_delay = Duration::from_secs(1);
-                            } else if let Some(uid_str) = trimmed.strip_prefix(UID_PREFIX) {
-                                if let Ok(uid) = uid_str.parse::<u32>() {
-                                    state.user_uid = Some(uid);
-                                }
+                            } else if trimmed == HEARTBEAT_MARKER {
+                                // Connection is alive, reset backoff
+                                reconnect_delay = Duration::from_secs(1);
                             } else {
                                 state.snapshot_lines.push(line);
                             }
