@@ -159,7 +159,7 @@ impl Tui {
                 Cell::from(" "),
                 Cell::from("Remote"),
                 Cell::from("Local"),
-                Cell::from("URL"),
+                Cell::from("Address"),
                 Cell::from("Age"),
             ])
             .style(Style::default().fg(Color::Yellow).bold());
@@ -181,7 +181,7 @@ impl Tui {
                         Cell::from(format!(":{}", fwd.remote_port)),
                         Cell::from(format!(":{}", fwd.local_port)),
                         Cell::from(if fwd.enabled {
-                            format!("http://127.0.0.1:{}", fwd.local_port)
+                            format!("localhost:{}", fwd.local_port)
                         } else {
                             "(disabled)".to_string()
                         }),
