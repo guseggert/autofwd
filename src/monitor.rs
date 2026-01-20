@@ -8,7 +8,7 @@ use tokio::process::Command;
 use crate::events::Event;
 use crate::ports::{find_free_local_port, PortFilter};
 use crate::probe::{detect_protocol, Protocol};
-use crate::proc_net::{parse_proc_net_output, remote_host_for, HostPref};
+use crate::proc_net::{parse_proc_net_output, remote_host_for, PortInfo};
 use crate::ssh::{
     ssh_forward_add, ssh_forward_cancel, ssh_master_check, ssh_master_start, SshContext,
 };
@@ -20,6 +20,7 @@ const HEARTBEAT_MARKER: &str = "__AUTOFWD_HEARTBEAT__";
 /// Generate the remote monitoring script that reads /proc/net/tcp directly.
 /// Uses server-side diffing: only sends data when listening ports change.
 /// This provides faster reaction time with lower bandwidth usage.
+/// Also resolves process names from socket inodes.
 fn remote_monitor_script(interval: Duration) -> String {
     let sleep_secs = interval.as_secs_f64();
     // Send heartbeat every ~5 seconds to confirm connection is alive
@@ -35,6 +36,31 @@ if [ ! -f /proc/net/tcp ]; then
     exit 2
 fi
 
+# Function to get process name for an inode
+# Scans /proc/*/fd/* to find matching socket inode
+get_proc_name() {{
+    local inode="$1"
+    if [ "$inode" = "0" ]; then
+        echo ""
+        return
+    fi
+    for fd in /proc/[0-9]*/fd/*; do
+        if link=$(readlink "$fd" 2>/dev/null); then
+            case "$link" in
+                "socket:[$inode]")
+                    pid="${{fd#/proc/}}"
+                    pid="${{pid%%/fd*}}"
+                    if [ -r "/proc/$pid/comm" ]; then
+                        cat "/proc/$pid/comm" 2>/dev/null
+                        return
+                    fi
+                    ;;
+            esac
+        fi
+    done
+    echo ""
+}}
+
 prev=""
 heartbeat=0
 
@@ -44,9 +70,28 @@ while :; do
     curr=$(awk '$4 == "0A" {{ print $2 }}' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort)
     
     if [ "$curr" != "$prev" ]; then
-        # State changed - send full snapshot with fflush() for immediate delivery
-        awk '$4 == "0A" {{ print; fflush() }}' /proc/net/tcp 2>/dev/null || true
-        awk '$4 == "0A" {{ print; fflush() }}' /proc/net/tcp6 2>/dev/null || true
+        # State changed - send full snapshot with process names
+        # Output format: original_line|process_name
+        while IFS= read -r line; do
+            # Skip header
+            case "$line" in
+                *local_address*) continue ;;
+            esac
+            # Extract inode (field 10, 0-indexed field 9)
+            inode=$(echo "$line" | awk '{{ print $10 }}')
+            proc=$(get_proc_name "$inode")
+            echo "$line|$proc"
+        done < <(awk '$4 == "0A"' /proc/net/tcp 2>/dev/null || true)
+        
+        while IFS= read -r line; do
+            case "$line" in
+                *local_address*) continue ;;
+            esac
+            inode=$(echo "$line" | awk '{{ print $10 }}')
+            proc=$(get_proc_name "$inode")
+            echo "$line|$proc"
+        done < <(awk '$4 == "0A"' /proc/net/tcp6 2>/dev/null || true)
+        
         echo "{END_MARKER}"
         prev="$curr"
         heartbeat=0
@@ -79,8 +124,8 @@ struct ForwardInfo {
 struct MonitorState {
     /// Active forwards: remote_port -> ForwardInfo.
     forwards: HashMap<u16, ForwardInfo>,
-    /// Last known host preferences for each port.
-    host_prefs: HashMap<u16, HostPref>,
+    /// Last known port info (host preferences and process name) for each port.
+    port_info: HashMap<u16, PortInfo>,
     /// Lines accumulated for the current snapshot.
     snapshot_lines: Vec<String>,
     /// Whether we've done the first scan.
@@ -93,7 +138,7 @@ impl MonitorState {
     fn new() -> Self {
         Self {
             forwards: HashMap::new(),
-            host_prefs: HashMap::new(),
+            port_info: HashMap::new(),
             snapshot_lines: Vec::new(),
             initialized: false,
             last_seen: HashSet::new(),
@@ -117,9 +162,9 @@ async fn process_snapshot(
     // Parse all listening ports (no UID filtering - Docker containers run as root)
     let snapshot = parse_proc_net_output(&output, None);
 
-    // Update host preferences
-    for (port, pref) in &snapshot {
-        state.host_prefs.insert(*port, *pref);
+    // Update port info (host preferences and process names)
+    for (port, info) in &snapshot {
+        state.port_info.insert(*port, info.clone());
     }
 
     let current_ports: HashSet<u16> = snapshot.keys().copied().collect();
@@ -204,13 +249,14 @@ async fn process_snapshot(
             continue;
         }
 
-        // Determine remote host based on address family
-        let pref = state
-            .host_prefs
+        // Get port info (host preferences and process name)
+        let info = state
+            .port_info
             .get(&remote_port)
-            .copied()
+            .cloned()
             .unwrap_or_default();
-        let remote_host = remote_host_for(&pref);
+        let remote_host = remote_host_for(&info.host_pref);
+        let process_name = info.process_name.clone();
 
         // Find a free local port
         let Some(local_port) = find_free_local_port(remote_port, collision_tries) else {
@@ -244,6 +290,7 @@ async fn process_snapshot(
                     forwarded_at: Instant::now(),
                     enabled: true,
                     protocol,
+                    process_name: process_name.clone(),
                 });
                 tui.status = format!("watching ({} forwarded)", tui.forwarded.len());
                 if local_port == remote_port {
@@ -256,6 +303,7 @@ async fn process_snapshot(
                     local_port,
                     remote_host,
                     protocol.as_str(),
+                    process_name,
                 ));
                 drop(tui);
 

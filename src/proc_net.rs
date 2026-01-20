@@ -7,6 +7,13 @@ pub struct HostPref {
     pub ipv6: bool,
 }
 
+/// Information about a listening port, including host preferences and process name.
+#[derive(Clone, Debug, Default)]
+pub struct PortInfo {
+    pub host_pref: HostPref,
+    pub process_name: Option<String>,
+}
+
 /// Represents a parsed entry from /proc/net/tcp or /proc/net/tcp6.
 #[derive(Debug)]
 pub struct TcpEntry {
@@ -16,6 +23,7 @@ pub struct TcpEntry {
     pub state: TcpState,
     pub is_ipv6: bool,
     pub uid: u32,
+    pub process_name: Option<String>,
 }
 
 /// TCP connection states from /proc/net/tcp.
@@ -101,8 +109,22 @@ fn parse_ipv6_addr(hex: &str) -> Option<String> {
 /// Parse a single line from /proc/net/tcp or /proc/net/tcp6.
 /// Format: sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode
 ///         0  1             2           3  4        5        6  7        8        9   10      11
+/// With process name suffix: <tcp_line>|<process_name>
 pub fn parse_proc_tcp_line(line: &str, is_ipv6: bool) -> Option<TcpEntry> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
+    // Check for process name suffix (format: <tcp_line>|<process_name>)
+    let (tcp_part, process_name) = if let Some(idx) = line.rfind('|') {
+        let proc = line[idx + 1..].trim();
+        let proc_name = if proc.is_empty() {
+            None
+        } else {
+            Some(proc.to_string())
+        };
+        (&line[..idx], proc_name)
+    } else {
+        (line, None)
+    };
+
+    let parts: Vec<&str> = tcp_part.split_whitespace().collect();
     if parts.len() < 10 {
         return None;
     }
@@ -136,14 +158,15 @@ pub fn parse_proc_tcp_line(line: &str, is_ipv6: bool) -> Option<TcpEntry> {
         state: TcpState::from(state_val),
         is_ipv6,
         uid,
+        process_name,
     })
 }
 
 /// Parse the combined output of /proc/net/tcp and /proc/net/tcp6.
-/// Returns a map of port -> HostPref for all listening ports.
+/// Returns a map of port -> PortInfo for all listening ports.
 /// If `filter_uid` is Some, only include ports owned by that UID.
-pub fn parse_proc_net_output(output: &str, filter_uid: Option<u32>) -> HashMap<u16, HostPref> {
-    let mut result: HashMap<u16, HostPref> = HashMap::new();
+pub fn parse_proc_net_output(output: &str, filter_uid: Option<u32>) -> HashMap<u16, PortInfo> {
+    let mut result: HashMap<u16, PortInfo> = HashMap::new();
 
     // Track whether we're in the tcp6 section
     let mut in_ipv6_section = false;
@@ -162,7 +185,9 @@ pub fn parse_proc_net_output(output: &str, filter_uid: Option<u32>) -> HashMap<u
         }
 
         // Try to detect IPv6 by address length in the line
-        let parts: Vec<&str> = line.split_whitespace().collect();
+        // Need to handle potential |process_name suffix
+        let tcp_part = line.split('|').next().unwrap_or(line);
+        let parts: Vec<&str> = tcp_part.split_whitespace().collect();
         if parts.len() >= 2 {
             if let Some((addr, _)) = parts[1].rsplit_once(':') {
                 in_ipv6_section = addr.len() == 32;
@@ -182,11 +207,15 @@ pub fn parse_proc_net_output(output: &str, filter_uid: Option<u32>) -> HashMap<u
                 }
             }
 
-            let pref = result.entry(entry.local_port).or_default();
+            let info = result.entry(entry.local_port).or_default();
             if entry.is_ipv6 {
-                pref.ipv6 = true;
+                info.host_pref.ipv6 = true;
             } else {
-                pref.ipv4 = true;
+                info.host_pref.ipv4 = true;
+            }
+            // Keep the first non-empty process name we find
+            if info.process_name.is_none() && entry.process_name.is_some() {
+                info.process_name = entry.process_name;
             }
         }
     }
@@ -223,6 +252,22 @@ mod tests {
         assert_eq!(entry.local_addr, "127.0.0.1");
         assert_eq!(entry.local_port, 0x0CEA); // 3306
         assert_eq!(entry.state, TcpState::Listen);
+        assert_eq!(entry.process_name, None);
+    }
+
+    #[test]
+    fn test_parse_tcp_line_with_process() {
+        // Line with process name suffix
+        let line = "   0: 0100007F:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1|mysqld";
+        let entry = parse_proc_tcp_line(line, false).unwrap();
+        assert_eq!(entry.local_addr, "127.0.0.1");
+        assert_eq!(entry.local_port, 0x0CEA); // 3306
+        assert_eq!(entry.process_name, Some("mysqld".to_string()));
+
+        // Line with empty process name
+        let line = "   0: 0100007F:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1|";
+        let entry = parse_proc_tcp_line(line, false).unwrap();
+        assert_eq!(entry.process_name, None);
     }
 
     #[test]
@@ -234,6 +279,27 @@ mod tests {
         let result = parse_proc_net_output(output, None);
         assert!(result.contains_key(&3306)); // 0x0CEA
         assert!(result.contains_key(&443)); // 0x01BB
+    }
+
+    #[test]
+    fn test_parse_output_with_process_names() {
+        let output = r#"   0: 0100007F:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1|mysqld
+   1: 00000000:01BB 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12346 1|nginx
+   2: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12347 1|"#;
+
+        let result = parse_proc_net_output(output, None);
+
+        // Check port 3306 (0x0CEA) has mysqld
+        let info_3306 = result.get(&3306).unwrap();
+        assert_eq!(info_3306.process_name, Some("mysqld".to_string()));
+
+        // Check port 443 (0x01BB) has nginx
+        let info_443 = result.get(&443).unwrap();
+        assert_eq!(info_443.process_name, Some("nginx".to_string()));
+
+        // Check port 8080 (0x1F90) has no process name
+        let info_8080 = result.get(&8080).unwrap();
+        assert_eq!(info_8080.process_name, None);
     }
 
     #[test]

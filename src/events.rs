@@ -12,6 +12,8 @@ pub enum Event {
         local_port: u16,
         remote_host: String,
         protocol: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        process_name: Option<String>,
     },
     /// Protocol was detected for a forwarded port
     ProtocolDetected {
@@ -51,6 +53,7 @@ impl Event {
         local_port: u16,
         remote_host: &str,
         protocol: &str,
+        process_name: Option<String>,
     ) -> Self {
         Event::ForwardAdded {
             ts: Utc::now(),
@@ -58,6 +61,7 @@ impl Event {
             local_port,
             remote_host: remote_host.to_string(),
             protocol: protocol.to_string(),
+            process_name,
         }
     }
 

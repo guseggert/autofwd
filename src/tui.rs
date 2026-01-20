@@ -28,6 +28,7 @@ pub struct ForwardedPort {
     pub forwarded_at: Instant,
     pub enabled: bool,
     pub protocol: Protocol,
+    pub process_name: Option<String>,
 }
 
 /// Commands from TUI to monitor for toggling forwards.
@@ -161,6 +162,7 @@ impl Tui {
                 Cell::from(" "),
                 Cell::from("Remote"),
                 Cell::from("Local"),
+                Cell::from("Process"),
                 Cell::from("Address"),
                 Cell::from("Age"),
             ])
@@ -173,6 +175,10 @@ impl Tui {
                     let age = fwd.forwarded_at.elapsed();
                     let age_str = format_duration(age);
                     let status_icon = if fwd.enabled { "●" } else { "○" };
+                    let process = fwd
+                        .process_name
+                        .as_deref()
+                        .unwrap_or("-");
                     let style = if fwd.enabled {
                         Style::default()
                     } else {
@@ -182,6 +188,7 @@ impl Tui {
                         Cell::from(status_icon),
                         Cell::from(format!(":{}", fwd.remote_port)),
                         Cell::from(format!(":{}", fwd.local_port)),
+                        Cell::from(process),
                         Cell::from(if fwd.enabled {
                             fwd.protocol.format_address(fwd.local_port)
                         } else {
@@ -199,6 +206,7 @@ impl Tui {
                     Constraint::Length(3),
                     Constraint::Length(10),
                     Constraint::Length(10),
+                    Constraint::Length(15),
                     Constraint::Min(25),
                     Constraint::Length(10),
                 ],
