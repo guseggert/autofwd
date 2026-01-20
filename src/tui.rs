@@ -7,7 +7,7 @@ use crossterm::{
 use futures::StreamExt;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState},
 };
 use std::io::{stdout, Stdout};
 use std::sync::Arc;
@@ -77,6 +77,7 @@ struct UiState {
     show_help: bool,
     show_events: bool,
     show_quit_confirm: bool,
+    table_state: TableState,
 }
 
 pub type SharedState = Arc<RwLock<TuiState>>;
@@ -119,7 +120,14 @@ impl Tui {
         Ok(())
     }
 
-    fn draw(&mut self, state: &TuiState, ui: &UiState, target: &str) -> Result<()> {
+    fn draw(&mut self, state: &TuiState, ui: &mut UiState, target: &str) -> Result<()> {
+        // Sync table selection with TuiState
+        ui.table_state.select(if state.forwarded.is_empty() {
+            None
+        } else {
+            Some(state.selected)
+        });
+
         self.terminal.draw(|frame| {
             let area = frame.area();
 
@@ -159,8 +167,7 @@ impl Tui {
             let rows: Vec<Row> = state
                 .forwarded
                 .iter()
-                .enumerate()
-                .map(|(i, fwd)| {
+                .map(|fwd| {
                     let age = fwd.forwarded_at.elapsed();
                     let age_str = format_duration(age);
                     let status_icon = if fwd.enabled { "●" } else { "○" };
@@ -168,11 +175,6 @@ impl Tui {
                         Style::default()
                     } else {
                         Style::default().fg(Color::DarkGray)
-                    };
-                    let highlight = if i == state.selected {
-                        style.bg(Color::DarkGray).fg(Color::White)
-                    } else {
-                        style
                     };
                     Row::new(vec![
                         Cell::from(status_icon),
@@ -185,7 +187,7 @@ impl Tui {
                         }),
                         Cell::from(age_str),
                     ])
-                    .style(highlight)
+                    .style(style)
                 })
                 .collect();
 
@@ -204,8 +206,10 @@ impl Tui {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Forwarded Ports "),
-            );
-            frame.render_widget(table, chunks[1]);
+            )
+            .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+            .highlight_symbol("→ ");
+            frame.render_stateful_widget(table, chunks[1], &mut ui.table_state);
 
             // Events log (only if toggled on and there are events)
             if ui.show_events && !state.events.is_empty() {
@@ -340,6 +344,7 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
         show_help: false,
         show_events: true, // Events visible by default
         show_quit_confirm: false,
+        table_state: TableState::default(),
     };
 
     let mut event_stream = EventStream::new();
@@ -347,7 +352,7 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
     // Initial draw
     {
         let s = state.read().await;
-        tui.draw(&s, &ui, &target)?;
+        tui.draw(&s, &mut ui, &target)?;
     }
 
     loop {
@@ -362,7 +367,7 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
                 state.write().await.quit_requested = false;
                 ui.show_quit_confirm = true;
                 let s = state.read().await;
-                tui.draw(&s, &ui, &target)?;
+                tui.draw(&s, &mut ui, &target)?;
             }
         }
 
@@ -446,12 +451,12 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
                         }
                         // Redraw after key press
                         let s = state.read().await;
-                        tui.draw(&s, &ui, &target)?;
+                        tui.draw(&s, &mut ui, &target)?;
                     }
                     Some(Ok(Event::Resize(_, _))) => {
                         // Redraw on terminal resize
                         let s = state.read().await;
-                        tui.draw(&s, &ui, &target)?;
+                        tui.draw(&s, &mut ui, &target)?;
                     }
                     Some(Err(_)) | None => {
                         // Stream ended or error
@@ -464,7 +469,7 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
             // Periodic redraw for age column updates (every 10 seconds)
             _ = tokio::time::sleep(Duration::from_secs(10)) => {
                 let s = state.read().await;
-                tui.draw(&s, &ui, &target)?;
+                tui.draw(&s, &mut ui, &target)?;
             }
         }
     }
