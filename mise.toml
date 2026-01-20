@@ -10,7 +10,7 @@ run = "cargo run -- {{arg(name='args', var=true)}}"
 description = "Run all tests"
 run = """
 docker build -t autofwd-test-ssh tests/docker
-cargo test
+cargo test -- --test-threads=1
 """
 
 [tasks."test:unit"]
