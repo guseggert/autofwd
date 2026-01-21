@@ -185,19 +185,24 @@ impl Tui {
                 ])
                 .split(area);
 
-            // Header with monitor mode indicator
-            let mode_indicator = match state.monitor_mode {
-                MonitorModeDisplay::Agent => {
-                    Span::styled(" [agent] ", Style::default().fg(Color::Green))
-                }
-                MonitorModeDisplay::Shell => {
-                    Span::styled(" [shell] ", Style::default().fg(Color::Yellow))
-                }
-                MonitorModeDisplay::Unknown => Span::raw(""),
+            // Header with monitor mode indicator (right-aligned)
+            let (mode_text, mode_style) = match state.monitor_mode {
+                MonitorModeDisplay::Agent => ("[agent]", Style::default().fg(Color::Green)),
+                MonitorModeDisplay::Shell => ("[shell]", Style::default().fg(Color::Yellow)),
+                MonitorModeDisplay::Unknown => ("", Style::default()),
             };
+            let left_text = format!(" {} - {}", target, state.status);
+            // Calculate padding to push mode indicator to the right
+            // chunks[0].width - 2 (borders) - left_text.len() - mode_text.len() - 1 (right padding)
+            let available_width = chunks[0].width.saturating_sub(2) as usize;
+            let padding_len = available_width
+                .saturating_sub(left_text.len())
+                .saturating_sub(mode_text.len())
+                .saturating_sub(1);
             let header_line = Line::from(vec![
-                Span::raw(format!(" {} - {}", target, state.status)),
-                mode_indicator,
+                Span::raw(left_text),
+                Span::raw(" ".repeat(padding_len)),
+                Span::styled(mode_text, mode_style),
             ]);
             let header = Paragraph::new(header_line)
                 .block(Block::default().borders(Borders::ALL).title(" autofwd "));
