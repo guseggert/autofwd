@@ -2,12 +2,12 @@
 Output docs/demo.gif
 
 Set Shell "bash"
-Set FontSize 14
-Set Width 1280
-Set Height 800
+Set FontSize 16
+Set Width 800
+Set Height 400
 Set Theme "Dracula"
 
-Type "autofwd testuser@localhost -- -p 2222 -i /tmp/demo_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+Type "autofwd demo"
 Enter
 Sleep 5s
 

@@ -47,8 +47,20 @@ jobs:
       - name: Build test Docker image
         run: docker build -t autofwd-test-ssh crates/autofwd/tests/docker
 
-      - name: Generate SSH key
-        run: ssh-keygen -t ed25519 -f /tmp/demo_key -N ""
+      - name: Generate SSH key and config
+        run: |
+          ssh-keygen -t ed25519 -f /tmp/demo_key -N ""
+          mkdir -p ~/.ssh
+          cat > ~/.ssh/config << 'EOF'
+          Host demo
+            HostName localhost
+            Port 2222
+            User testuser
+            IdentityFile /tmp/demo_key
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+          EOF
+          chmod 600 ~/.ssh/config
 
       - name: Start demo container with mock services
         run: |
