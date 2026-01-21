@@ -4,7 +4,7 @@
 # Output settings
 Output docs/demo.gif
 Set Width 120
-Set Height 25
+Set Height 40
 Set FontSize 18
 Set FontFamily "DejaVu Sans Mono"
 Set Theme "Dracula"
