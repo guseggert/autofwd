@@ -85,7 +85,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run unit tests
-        run: cargo test --workspace --lib
+        run: cargo test --workspace --bins
 
   # Run e2e tests on each architecture
   e2e:

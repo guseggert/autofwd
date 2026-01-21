@@ -17,11 +17,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg zstd
 
+      - name: Install ttyd
+        run: |
+          TTYD_VERSION="1.7.7"
+          wget -q "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" -O ttyd
+          chmod +x ttyd
+          sudo mv ttyd /usr/local/bin/
+          ttyd --version
+
       - name: Install VHS
         run: |
           VHS_VERSION="0.8.0"
           wget -qO- "https://github.com/charmbracelet/vhs/releases/download/v${VHS_VERSION}/vhs_${VHS_VERSION}_Linux_x86_64.tar.gz" | tar xz
-          sudo mv "vhs_${VHS_VERSION}_Linux_x86_64/vhs" /usr/local/bin/
+          sudo mv vhs_${VHS_VERSION}_Linux_x86_64/vhs /usr/local/bin/
           vhs --version
 
       - name: Install Rust toolchain
