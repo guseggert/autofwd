@@ -21,7 +21,7 @@ jobs:
         run: |
           VHS_VERSION="0.8.0"
           wget -qO- "https://github.com/charmbracelet/vhs/releases/download/v${VHS_VERSION}/vhs_${VHS_VERSION}_Linux_x86_64.tar.gz" | tar xz
-          sudo mv vhs /usr/local/bin/
+          sudo mv "vhs_${VHS_VERSION}_Linux_x86_64/vhs" /usr/local/bin/
           vhs --version
 
       - name: Install Rust toolchain
