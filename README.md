@@ -2,6 +2,8 @@
 
 Automatic port forwarding for SSH sessions. Detects listening ports on a remote server and forwards them to your local machine — like VS Code/Cursor, but for the terminal.
 
+![autofwd demo](docs/demo.gif)
+
 ## Features
 
 - **Automatic detection** — monitors listening ports on the remote host and forwards them as they appear

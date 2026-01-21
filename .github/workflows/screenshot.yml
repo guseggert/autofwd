@@ -1,0 +1,146 @@
+name: Generate Demo GIF
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  generate-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg zstd
+
+      - name: Install VHS
+        run: |
+          VHS_VERSION="0.8.0"
+          wget -qO- "https://github.com/charmbracelet/vhs/releases/download/v${VHS_VERSION}/vhs_${VHS_VERSION}_Linux_x86_64.tar.gz" | tar xz
+          sudo mv vhs /usr/local/bin/
+          vhs --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-demo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build agents
+        run: |
+          mkdir -p target/agents
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
+            echo "Building agent for $target..."
+            cross build --release --target "$target" -p autofwd-agent
+            zstd -19 "target/$target/release/autofwd-agent" -o "target/agents/$target.zst"
+          done
+          ls -lh target/agents/
+
+      - name: Build autofwd
+        run: cargo build --release -p autofwd
+
+      - name: Build test Docker image
+        run: docker build -t autofwd-test-ssh crates/autofwd/tests/docker
+
+      - name: Generate SSH key
+        run: |
+          ssh-keygen -t ed25519 -f /tmp/demo_key -N ""
+          cat /tmp/demo_key.pub
+
+      - name: Start demo container with mock services
+        run: |
+          # Start container
+          docker run -d \
+            --name demo \
+            -p 2222:22 \
+            -v /tmp/demo_key.pub:/home/testuser/.ssh/authorized_keys:ro \
+            autofwd-test-ssh
+
+          # Wait for SSH to be ready
+          sleep 3
+
+          # Copy netcat to fake process names and start services
+          # HTTP "server" (python3)
+          docker exec demo sh -c '
+            cp /usr/bin/nc /tmp/python3
+            while true; do 
+              echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello" | /tmp/python3 -l -p 3000 -q 1 2>/dev/null
+            done &
+          '
+
+          # PostgreSQL mock (postgres)
+          docker exec demo sh -c '
+            cp /usr/bin/nc /tmp/postgres
+            while true; do
+              /tmp/postgres -l -p 5432 -q 1 2>/dev/null
+            done &
+          '
+
+          # Redis mock (redis-server)
+          docker exec demo sh -c '
+            cp /usr/bin/nc /tmp/redis-server
+            while true; do 
+              echo "+PONG" | /tmp/redis-server -l -p 6379 -q 1 2>/dev/null
+            done &
+          '
+
+          # Verify services are running
+          sleep 2
+          docker exec demo netstat -tlnp || true
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          cat > ~/.ssh/config << 'EOF'
+          Host localhost
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile /tmp/demo_key
+            LogLevel ERROR
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Test SSH connection
+        run: |
+          ssh -p 2222 testuser@localhost "echo 'SSH connection successful'"
+
+      - name: Generate demo GIF
+        run: |
+          # Add the built binary to PATH
+          export PATH="$PWD/target/release:$PATH"
+          
+          # Run VHS
+          vhs docs/demo.tape
+          
+          # Verify output
+          ls -lh docs/demo.gif
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f demo || true
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/demo.gif
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "docs: update demo GIF [skip ci]"
+            git push
+          fi
