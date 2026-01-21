@@ -10,8 +10,52 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Build agent binaries for all Linux targets
+  build-agents:
+    name: Build Agents
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install zstd
+        run: sudo apt-get install -y zstd
+
+      - name: Build agents
+        run: |
+          mkdir -p target/agents
+          
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
+            echo "Building agent for $target..."
+            cross build --release --target "$target" -p autofwd-agent
+            
+            # Strip the binary
+            docker run --rm -v "$(pwd):/work" -w /work "ghcr.io/cross-rs/$target:main" \
+              strip "target/$target/release/autofwd-agent" || true
+            
+            # Compress with zstd
+            zstd -19 -f "target/$target/release/autofwd-agent" -o "target/agents/$target.zst"
+          done
+          
+          echo "Agent sizes:"
+          ls -lh target/agents/
+
+      - name: Upload agents
+        uses: actions/upload-artifact@v4
+        with:
+          name: agents
+          path: target/agents/
+
+  # Build main binary for each platform
   build:
     name: Build ${{ matrix.target }}
+    needs: build-agents
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,6 +82,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Download agents
+        uses: actions/download-artifact@v4
+        with:
+          name: agents
+          path: target/agents/
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,11 +99,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }} -p autofwd
 
       - name: Build (native)
         if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p autofwd
 
       - name: Package
         shell: bash
@@ -68,6 +118,7 @@ jobs:
           name: autofwd-${{ matrix.target }}
           path: autofwd-${{ matrix.target }}.tar.gz
 
+  # Create release on tag push
   release:
     name: Create Release
     needs: build
@@ -88,7 +139,7 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p release
-          mv artifacts/*/*.tar.gz release/
+          mv artifacts/autofwd-*/*.tar.gz release/
           cd release
           sha256sum *.tar.gz > checksums-sha256.txt
           cat checksums-sha256.txt

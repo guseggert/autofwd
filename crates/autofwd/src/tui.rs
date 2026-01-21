@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    event::{Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -40,6 +40,17 @@ pub enum TuiCommand {
 /// Channel for emitting JSON events in headless mode.
 pub type EventSender = mpsc::UnboundedSender<JsonEvent>;
 
+/// Monitor mode indicator for the TUI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum MonitorModeDisplay {
+    #[default]
+    Unknown,
+    /// Using the deployed agent binary (with process names).
+    Agent,
+    /// Fallback to shell script (no process names).
+    Shell,
+}
+
 /// Shared state between the monitor and the TUI.
 #[derive(Debug, Default)]
 pub struct TuiState {
@@ -49,6 +60,8 @@ pub struct TuiState {
     pub quit_requested: bool, // Set by Ctrl+C to trigger confirmation
     pub selected: usize,
     pub events: Vec<String>,
+    /// Current monitoring mode (agent or shell fallback).
+    pub monitor_mode: MonitorModeDisplay,
     /// Optional channel for JSON events (headless mode)
     #[allow(dead_code)]
     event_tx: Option<EventSender>,
@@ -87,16 +100,36 @@ pub type SharedState = Arc<RwLock<TuiState>>;
 pub type CommandSender = mpsc::Sender<TuiCommand>;
 pub type CommandReceiver = mpsc::Receiver<TuiCommand>;
 
-pub fn new_shared_state(event_tx: Option<EventSender>) -> SharedState {
-    Arc::new(RwLock::new(TuiState {
+/// Notifier to trigger TUI redraws when state changes.
+pub type RedrawNotify = Arc<tokio::sync::Notify>;
+
+/// Unified event type for the TUI event loop.
+/// All events (keyboard, resize, tick, state changes) flow through a single channel.
+#[derive(Debug)]
+pub enum TuiEvent {
+    /// Keyboard input
+    Key(KeyEvent),
+    /// Terminal resize (triggers redraw)
+    Resize,
+    /// Periodic tick for updating time-based displays (age column)
+    Tick,
+    /// Monitor state changed (ports added/removed, status update)
+    StateChanged,
+}
+
+pub fn new_shared_state(event_tx: Option<EventSender>) -> (SharedState, RedrawNotify) {
+    let state = Arc::new(RwLock::new(TuiState {
         status: "connecting...".to_string(),
         forwarded: Vec::new(),
         should_quit: false,
         quit_requested: false,
         selected: 0,
         events: Vec::new(),
+        monitor_mode: MonitorModeDisplay::Unknown,
         event_tx,
-    }))
+    }));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    (state, notify)
 }
 
 pub fn new_command_channel() -> (CommandSender, CommandReceiver) {
@@ -152,8 +185,23 @@ impl Tui {
                 ])
                 .split(area);
 
-            // Header
-            let header = Paragraph::new(format!(" {} - {}", target, state.status))
+            // Header with monitor mode indicator
+            let mode_indicator = match state.monitor_mode {
+                MonitorModeDisplay::Agent => Span::styled(
+                    " [agent] ",
+                    Style::default().fg(Color::Green),
+                ),
+                MonitorModeDisplay::Shell => Span::styled(
+                    " [shell] ",
+                    Style::default().fg(Color::Yellow),
+                ),
+                MonitorModeDisplay::Unknown => Span::raw(""),
+            };
+            let header_line = Line::from(vec![
+                Span::raw(format!(" {} - {}", target, state.status)),
+                mode_indicator,
+            ]);
+            let header = Paragraph::new(header_line)
                 .block(Block::default().borders(Borders::ALL).title(" autofwd "));
             frame.render_widget(header, chunks[0]);
 
@@ -347,8 +395,64 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Spawn background tasks that feed events into a unified channel.
+/// Returns a receiver for all TUI events.
+fn spawn_event_handler(redraw_notify: RedrawNotify) -> mpsc::UnboundedReceiver<TuiEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Task 1: Crossterm terminal events (keyboard, resize)
+    let tx_term = tx.clone();
+    tokio::spawn(async move {
+        let mut event_stream = EventStream::new();
+        while let Some(event) = event_stream.next().await {
+            let event = match event {
+                Ok(CrosstermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
+                    TuiEvent::Key(key)
+                }
+                Ok(CrosstermEvent::Resize(_, _)) => TuiEvent::Resize,
+                Ok(_) => continue, // Ignore mouse, focus, paste events
+                Err(_) => break,   // Stream error, exit
+            };
+            if tx_term.send(event).is_err() {
+                break; // Receiver dropped
+            }
+        }
+    });
+
+    // Task 2: Tick timer for age column updates (1 second)
+    let tx_tick = tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if tx_tick.send(TuiEvent::Tick).is_err() {
+                break; // Receiver dropped
+            }
+        }
+    });
+
+    // Task 3: State change notifications from monitor
+    let tx_state = tx;
+    tokio::spawn(async move {
+        loop {
+            redraw_notify.notified().await;
+            if tx_state.send(TuiEvent::StateChanged).is_err() {
+                break; // Receiver dropped
+            }
+        }
+    });
+
+    rx
+}
+
 /// Run the TUI event loop.
-pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) -> Result<()> {
+pub async fn run_tui(
+    state: SharedState,
+    target: String,
+    cmd_tx: CommandSender,
+    redraw_notify: RedrawNotify,
+) -> Result<()> {
     let mut tui = Tui::new()?;
     let mut ui = UiState {
         show_help: false,
@@ -357,7 +461,8 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
         table_state: TableState::default(),
     };
 
-    let mut event_stream = EventStream::new();
+    // Unified event channel - all events flow through here
+    let mut events = spawn_event_handler(redraw_notify);
 
     // Initial draw
     {
@@ -365,8 +470,9 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
         tui.draw(&s, &mut ui, &target)?;
     }
 
-    loop {
-        // Check for quit/quit_requested
+    // Main event loop - simple recv from unified channel
+    while let Some(event) = events.recv().await {
+        // Check for quit/quit_requested from monitor
         {
             let s = state.read().await;
             if s.should_quit {
@@ -376,113 +482,109 @@ pub async fn run_tui(state: SharedState, target: String, cmd_tx: CommandSender) 
                 drop(s);
                 state.write().await.quit_requested = false;
                 ui.show_quit_confirm = true;
-                let s = state.read().await;
-                tui.draw(&s, &mut ui, &target)?;
             }
         }
 
-        // Wait for: keyboard event OR periodic redraw (for age updates)
-        tokio::select! {
-            // Keyboard input - no polling, just async wait
-            maybe_event = event_stream.next() => {
-                match maybe_event {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        // Handle quit confirmation dialog
-                        if ui.show_quit_confirm {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                    state.write().await.should_quit = true;
-                                    break;
-                                }
-                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                    ui.show_quit_confirm = false;
-                                }
-                                _ => {}
-                            }
-                        } else if ui.show_help {
-                            // Any key closes help
-                            ui.show_help = false;
-                        } else {
-                            // Normal key handling
-                            let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
-                            if is_ctrl {
-                                match key.code {
-                                    KeyCode::Char('p') => {
-                                        let mut s = state.write().await;
-                                        if s.selected > 0 {
-                                            s.selected -= 1;
-                                        }
-                                    }
-                                    KeyCode::Char('n') => {
-                                        let mut s = state.write().await;
-                                        let len = s.forwarded.len();
-                                        if len > 0 && s.selected < len - 1 {
-                                            s.selected += 1;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            } else {
-                                match key.code {
-                                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                                        ui.show_quit_confirm = true;
-                                    }
-                                    KeyCode::Char('?') => {
-                                        ui.show_help = true;
-                                    }
-                                    KeyCode::Char('e') | KeyCode::Char('E') => {
-                                        ui.show_events = !ui.show_events;
-                                    }
-                                    KeyCode::Up | KeyCode::Char('k') => {
-                                        let mut s = state.write().await;
-                                        if s.selected > 0 {
-                                            s.selected -= 1;
-                                        }
-                                    }
-                                    KeyCode::Down | KeyCode::Char('j') => {
-                                        let mut s = state.write().await;
-                                        let len = s.forwarded.len();
-                                        if len > 0 && s.selected < len - 1 {
-                                            s.selected += 1;
-                                        }
-                                    }
-                                    KeyCode::Char(' ') => {
-                                        let s = state.read().await;
-                                        if !s.forwarded.is_empty() {
-                                            let _ = cmd_tx
-                                                .send(TuiCommand::ToggleForward { index: s.selected })
-                                                .await;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        // Redraw after key press
-                        let s = state.read().await;
-                        tui.draw(&s, &mut ui, &target)?;
-                    }
-                    Some(Ok(Event::Resize(_, _))) => {
-                        // Redraw on terminal resize
-                        let s = state.read().await;
-                        tui.draw(&s, &mut ui, &target)?;
-                    }
-                    Some(Err(_)) | None => {
-                        // Stream ended or error
-                        break;
-                    }
-                    _ => {} // Ignore other events (mouse, etc.)
-                }
+        match event {
+            TuiEvent::Key(key) => {
+                handle_key_event(key, &state, &mut ui, &cmd_tx).await;
             }
-
-            // Periodic redraw for age column updates (every 10 seconds)
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                let s = state.read().await;
-                tui.draw(&s, &mut ui, &target)?;
+            TuiEvent::Resize | TuiEvent::Tick | TuiEvent::StateChanged => {
+                // Just redraw below
             }
         }
+
+        // Redraw after every event
+        let s = state.read().await;
+        if s.should_quit {
+            break;
+        }
+        tui.draw(&s, &mut ui, &target)?;
     }
 
     Ok(())
+}
+
+/// Handle keyboard input, updating UI and shared state as needed.
+async fn handle_key_event(
+    key: KeyEvent,
+    state: &SharedState,
+    ui: &mut UiState,
+    cmd_tx: &CommandSender,
+) {
+    // Handle quit confirmation dialog
+    if ui.show_quit_confirm {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                state.write().await.should_quit = true;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                ui.show_quit_confirm = false;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Help overlay - any key closes it
+    if ui.show_help {
+        ui.show_help = false;
+        return;
+    }
+
+    // Normal key handling
+    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    if is_ctrl {
+        match key.code {
+            KeyCode::Char('p') => {
+                let mut s = state.write().await;
+                if s.selected > 0 {
+                    s.selected -= 1;
+                }
+            }
+            KeyCode::Char('n') => {
+                let mut s = state.write().await;
+                let len = s.forwarded.len();
+                if len > 0 && s.selected < len - 1 {
+                    s.selected += 1;
+                }
+            }
+            _ => {}
+        }
+    } else {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                ui.show_quit_confirm = true;
+            }
+            KeyCode::Char('?') => {
+                ui.show_help = true;
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                ui.show_events = !ui.show_events;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let mut s = state.write().await;
+                if s.selected > 0 {
+                    s.selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let mut s = state.write().await;
+                let len = s.forwarded.len();
+                if len > 0 && s.selected < len - 1 {
+                    s.selected += 1;
+                }
+            }
+            KeyCode::Char(' ') => {
+                let s = state.read().await;
+                if !s.forwarded.is_empty() {
+                    let _ = cmd_tx
+                        .send(TuiCommand::ToggleForward { index: s.selected })
+                        .await;
+                }
+            }
+            _ => {}
+        }
+    }
 }

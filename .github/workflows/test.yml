@@ -10,12 +10,65 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  unit:
-    name: Unit Tests
+  # Build real agent binaries for all targets
+  build-agents:
+    name: Build Agents
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install zstd
+        run: sudo apt-get install -y zstd
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-agents-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build all agents
+        run: |
+          mkdir -p target/agents
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
+            echo "Building agent for $target..."
+            cross build --release --target "$target" -p autofwd-agent
+            zstd -19 "target/$target/release/autofwd-agent" -o "target/agents/$target.zst"
+          done
+          echo "Agent sizes:"
+          ls -lh target/agents/
+
+      - name: Upload agents
+        uses: actions/upload-artifact@v4
+        with:
+          name: agents
+          path: target/agents/
+
+  # Run unit tests
+  unit:
+    name: Unit Tests
+    needs: build-agents
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download agents
+        uses: actions/download-artifact@v4
+        with:
+          name: agents
+          path: target/agents/
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -32,14 +85,39 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run unit tests
-        run: cargo test --bins
+        run: cargo test --workspace --lib
 
+  # Run e2e tests on each architecture
   e2e:
-    name: E2E Tests
+    name: E2E (${{ matrix.arch_name }})
+    needs: build-agents
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch_name: x86_64
+          - platform: linux/arm64
+            arch_name: aarch64
+          - platform: linux/arm/v7
+            arch_name: armv7
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download agents
+        uses: actions/download-artifact@v4
+        with:
+          name: agents
+          path: target/agents/
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -55,19 +133,34 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build Docker test image
-        run: docker build -t autofwd-test-ssh tests/docker
+      - name: Build test image for ${{ matrix.platform }}
+        run: |
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            --load \
+            -t autofwd-test-ssh \
+            crates/autofwd/tests/docker
 
       - name: Run E2E tests
-        run: cargo test --test e2e -- --test-threads=1
-        timeout-minutes: 10
+        run: cargo test --test e2e -p autofwd -- --test-threads=1
+        timeout-minutes: 20
+        env:
+          AUTOFWD_TEST_PLATFORM: ${{ matrix.platform }}
 
+  # Lint checks
   lint:
     name: Lint
+    needs: build-agents
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download agents
+        uses: actions/download-artifact@v4
+        with:
+          name: agents
+          path: target/agents/
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -75,7 +168,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace -- -D warnings

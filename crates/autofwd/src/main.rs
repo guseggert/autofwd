@@ -1,3 +1,5 @@
+mod deploy;
+mod embedded;
 mod events;
 mod monitor;
 mod ports;
@@ -79,6 +81,8 @@ impl Drop for CleanupGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    use std::time::Instant;
+
     let args = Args::parse();
     let control_path: PathBuf = control_path_for(&args.target);
 
@@ -91,7 +95,14 @@ async fn main() -> Result<()> {
     };
 
     // Start SSH control master
+    let ssh_start = Instant::now();
     ssh_master_start(&ctx).await?;
+    let ssh_duration = ssh_start.elapsed();
+
+    // Emit timing in headless mode
+    if args.headless {
+        Event::timing("ssh_master_start", ssh_duration.as_millis() as u64).emit();
+    }
 
     // Set up cleanup guard - ensures cleanup even on panic
     let _cleanup = CleanupGuard { ctx: ctx.clone() };
@@ -110,8 +121,8 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Create shared state and command channel
-    let tui_state = new_shared_state(event_tx);
+    // Create shared state, redraw notifier, and command channel
+    let (tui_state, redraw_notify) = new_shared_state(event_tx);
     let (cmd_tx, cmd_rx) = new_command_channel();
 
     // Spawn monitor task
@@ -119,6 +130,7 @@ async fn main() -> Result<()> {
         let monitor_ctx = ctx.clone();
         let monitor_filter = filter.clone();
         let monitor_state = tui_state.clone();
+        let monitor_notify = redraw_notify.clone();
         let interval = args.interval;
         let collision_tries = args.collision_tries;
         let assume_http = args.assume_http;
@@ -130,6 +142,7 @@ async fn main() -> Result<()> {
                 collision_tries,
                 assume_http,
                 monitor_state,
+                monitor_notify,
                 cmd_rx,
             )
             .await;
@@ -137,8 +150,8 @@ async fn main() -> Result<()> {
     };
 
     if args.headless {
-        // Headless mode: emit ready event and wait for signals
-        tui_state.read().await.emit(Event::ready(&args.target));
+        // Headless mode: wait for signals
+        // Note: ready event is emitted by run_monitor after agent deployment
 
         // Wait for Ctrl+C or SIGTERM
         let signal_state = tui_state.clone();
@@ -187,7 +200,7 @@ async fn main() -> Result<()> {
         });
 
         // Run TUI (blocks until quit confirmed)
-        run_tui(tui_state.clone(), args.target.clone(), cmd_tx).await?;
+        run_tui(tui_state.clone(), args.target.clone(), cmd_tx, redraw_notify).await?;
 
         // Signal monitor to stop
         tui_state.write().await.should_quit = true;

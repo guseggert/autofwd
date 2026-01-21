@@ -12,6 +12,12 @@ fn unique_id() -> String {
     format!("{}-{}", std::process::id(), rand::random::<u32>())
 }
 
+/// Get the Docker platform to use for tests (from AUTOFWD_TEST_PLATFORM env var).
+/// If not set, returns None (use default/native platform).
+pub fn get_test_platform() -> Option<String> {
+    std::env::var("AUTOFWD_TEST_PLATFORM").ok()
+}
+
 /// Container types for protocol detection testing.
 #[derive(Clone, Copy, Debug)]
 pub enum ContainerType {
@@ -338,6 +344,12 @@ impl TestContainer {
             "-P".to_string(), // Publish all exposed ports to random host ports
         ];
 
+        // Add platform if specified (for multi-arch testing)
+        if let Some(platform) = get_test_platform() {
+            args.push("--platform".to_string());
+            args.push(platform);
+        }
+
         // Add network if specified
         if let Some(net) = network {
             args.push("--network".to_string());
@@ -657,33 +669,58 @@ impl Drop for TestContainer {
 }
 
 /// Build the test Docker image if it doesn't exist.
+/// If AUTOFWD_TEST_PLATFORM is set, uses buildx to build for that platform.
 pub fn ensure_image_built() -> Result<()> {
+    let platform = get_test_platform();
+
     // Check if image exists
     let output = Command::new("docker")
         .args(["images", "-q", SSH_IMAGE_NAME])
         .output()
         .context("failed to check for docker image")?;
 
-    if !output.stdout.is_empty() {
-        return Ok(()); // Image exists
+    if !output.stdout.is_empty() && platform.is_none() {
+        return Ok(()); // Image exists and no specific platform requested
     }
 
     // Build the image
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let dockerfile_path = Path::new(manifest_dir).join("tests/docker");
 
-    let status = Command::new("docker")
-        .args([
-            "build",
-            "-t",
-            SSH_IMAGE_NAME,
-            dockerfile_path.to_str().unwrap(),
-        ])
-        .status()
-        .context("failed to build docker image")?;
+    if let Some(plat) = platform {
+        // Use buildx for multi-platform builds
+        let status = Command::new("docker")
+            .args([
+                "buildx",
+                "build",
+                "--platform",
+                &plat,
+                "--load",
+                "-t",
+                SSH_IMAGE_NAME,
+                dockerfile_path.to_str().unwrap(),
+            ])
+            .status()
+            .context("failed to build docker image with buildx")?;
 
-    if !status.success() {
-        bail!("docker build failed");
+        if !status.success() {
+            bail!("docker buildx build failed for platform {}", plat);
+        }
+    } else {
+        // Regular build for native platform
+        let status = Command::new("docker")
+            .args([
+                "build",
+                "-t",
+                SSH_IMAGE_NAME,
+                dockerfile_path.to_str().unwrap(),
+            ])
+            .status()
+            .context("failed to build docker image")?;
+
+        if !status.success() {
+            bail!("docker build failed");
+        }
     }
 
     Ok(())

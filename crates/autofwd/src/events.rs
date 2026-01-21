@@ -45,6 +45,23 @@ pub enum Event {
     Ready { ts: DateTime<Utc>, target: String },
     /// Shutting down
     Shutdown { ts: DateTime<Utc> },
+    /// Agent is being deployed to remote
+    #[allow(dead_code)]
+    AgentDeploying { ts: DateTime<Utc>, arch: String },
+    /// Agent was successfully deployed
+    AgentDeployed {
+        ts: DateTime<Utc>,
+        arch: String,
+        duration_ms: u64,
+    },
+    /// Falling back to shell script (agent unavailable)
+    AgentFallback { ts: DateTime<Utc>, reason: String },
+    /// Debug timing checkpoint
+    Timing {
+        ts: DateTime<Utc>,
+        phase: String,
+        duration_ms: u64,
+    },
 }
 
 impl Event {
@@ -133,6 +150,37 @@ impl Event {
 
     pub fn shutdown() -> Self {
         Event::Shutdown { ts: Utc::now() }
+    }
+
+    #[allow(dead_code)]
+    pub fn agent_deploying(arch: &str) -> Self {
+        Event::AgentDeploying {
+            ts: Utc::now(),
+            arch: arch.to_string(),
+        }
+    }
+
+    pub fn agent_deployed(arch: &str, duration_ms: u64) -> Self {
+        Event::AgentDeployed {
+            ts: Utc::now(),
+            arch: arch.to_string(),
+            duration_ms,
+        }
+    }
+
+    pub fn agent_fallback(reason: &str) -> Self {
+        Event::AgentFallback {
+            ts: Utc::now(),
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn timing(phase: &str, duration_ms: u64) -> Self {
+        Event::Timing {
+            ts: Utc::now(),
+            phase: phase.to_string(),
+            duration_ms,
+        }
     }
 
     /// Serialize to JSON and print to stdout

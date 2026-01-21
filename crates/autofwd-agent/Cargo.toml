@@ -1,0 +1,10 @@
+[package]
+name = "autofwd-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Server-side agent for autofwd port monitoring"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

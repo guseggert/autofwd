@@ -22,15 +22,27 @@ struct AutofwdProcess {
 
 impl AutofwdProcess {
     fn start(container: &TestContainer) -> Result<Self> {
-        Self::start_with_args(container, &[])
+        Self::start_with_options(container, &[], &[])
     }
 
     fn start_with_args(container: &TestContainer, extra_args: &[&str]) -> Result<Self> {
+        Self::start_with_options(container, extra_args, &[])
+    }
+
+    fn start_with_options(
+        container: &TestContainer,
+        extra_args: &[&str],
+        env_vars: &[(&str, &str)],
+    ) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_autofwd"));
         cmd.arg("--headless").arg("--interval").arg("500ms");
 
         for arg in extra_args {
             cmd.arg(arg);
+        }
+
+        for (key, value) in env_vars {
+            cmd.env(key, value);
         }
 
         cmd.arg(container.ssh_target())
@@ -83,6 +95,44 @@ impl AutofwdProcess {
                     let event: Value = serde_json::from_str(&line)?;
                     if event.get("event").and_then(|e| e.as_str()) == Some(event_type) {
                         return Ok(event);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    anyhow::bail!("timeout waiting for event: {}", event_type);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("EOF without finding event: {}", event_type);
+                }
+            }
+        }
+    }
+
+    /// Wait for the expected event and return it along with all events seen.
+    /// Useful for checking what events were (or weren't) emitted.
+    fn wait_for_event_collecting(
+        &mut self,
+        event_type: &str,
+        timeout: Duration,
+    ) -> Result<(Value, Vec<Value>)> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut collected = Vec::new();
+
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timeout waiting for event: {}", event_type);
+            }
+
+            match self.line_rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let event: Value = serde_json::from_str(&line)?;
+                    collected.push(event.clone());
+                    if event.get("event").and_then(|e| e.as_str()) == Some(event_type) {
+                        return Ok((event, collected));
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -451,6 +501,250 @@ fn test_assume_http_flag() -> Result<()> {
     );
     // With --assume-http, protocol should be "http" even for redis
     assert_eq!(event.get("protocol").and_then(|p| p.as_str()), Some("http"));
+
+    Ok(())
+}
+
+// ============================================================================
+// Agent Deployment Tests
+// ============================================================================
+
+/// Check if we're running with real agent binaries (not stubs).
+/// Real binaries are >50KB, stubs are just a few bytes.
+fn agents_available() -> bool {
+    // Check if target/agents directory has files >50KB
+    let agents_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("target/agents");
+
+    if !agents_dir.exists() {
+        return false;
+    }
+
+    // Check x86_64 agent size (it's always built)
+    let x86_agent = agents_dir.join("x86_64-unknown-linux-musl.zst");
+    if let Ok(metadata) = std::fs::metadata(&x86_agent) {
+        metadata.len() > 50_000
+    } else {
+        false
+    }
+}
+
+#[test]
+fn test_agent_deployment() -> Result<()> {
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    let mut autofwd = AutofwdProcess::start(&container)?;
+
+    // Collect events while waiting for ready
+    let (_ready, events) = autofwd.wait_for_event_collecting("ready", Duration::from_secs(15))?;
+
+    // Check what agent-related event we got
+    let got_deployed = events
+        .iter()
+        .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("agent_deployed"));
+    let got_fallback = events
+        .iter()
+        .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("agent_fallback"));
+
+    if agents_available() {
+        // With real agents, we should see agent_deployed, not agent_fallback
+        assert!(
+            got_deployed,
+            "Expected agent_deployed event with real agent binaries. Events: {:?}",
+            events
+        );
+        assert!(
+            !got_fallback,
+            "Should not see agent_fallback with real agent binaries. Events: {:?}",
+            events
+        );
+
+        // Check the architecture in agent_deployed
+        let deployed_event = events
+            .iter()
+            .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("agent_deployed"))
+            .unwrap();
+        let arch = deployed_event.get("arch").and_then(|v| v.as_str());
+        assert!(
+            arch.is_some(),
+            "agent_deployed should include arch. Event: {:?}",
+            deployed_event
+        );
+        println!("Agent deployed for arch: {}", arch.unwrap());
+    } else {
+        // With stub agents, we should see agent_fallback
+        assert!(
+            got_fallback,
+            "Expected agent_fallback event with stub binaries. Events: {:?}",
+            events
+        );
+        println!("Running with stub agents, fallback used as expected");
+    }
+
+    // Verify port forwarding still works either way
+    container.start_listener(9999)?;
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(10))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(9999)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_agent_with_process_name() -> Result<()> {
+    // This test verifies that process names are detected when using the agent
+    // (process names are NOT available in shell fallback mode)
+    if !agents_available() {
+        println!("Skipping test_agent_with_process_name - agents not available");
+        return Ok(());
+    }
+
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    let mut autofwd = AutofwdProcess::start(&container)?;
+
+    // Wait for agent to be deployed
+    let (_ready, events) = autofwd.wait_for_event_collecting("ready", Duration::from_secs(15))?;
+    let got_deployed = events
+        .iter()
+        .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("agent_deployed"));
+    assert!(got_deployed, "Agent should be deployed for this test");
+
+    // Start a listener (nc command)
+    container.start_listener(8888)?;
+
+    // Wait for forward_added
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(10))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(8888)
+    );
+
+    // With the agent, process_name should be detected
+    // Note: The listener uses 'nc' via a shell loop, so we expect "sh" or "nc"
+    let process_name = event.get("process_name").and_then(|v| v.as_str());
+    assert!(
+        process_name.is_some(),
+        "Agent should detect process name. Event: {:?}",
+        event
+    );
+    println!("Detected process name: {}", process_name.unwrap());
+
+    Ok(())
+}
+
+#[test]
+fn test_shell_fallback_mode() -> Result<()> {
+    // This test verifies that the shell fallback mode works correctly
+    // by forcing it via AUTOFWD_FORCE_SHELL environment variable.
+    // This ensures port forwarding works even without the agent.
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    // Start autofwd with forced shell mode
+    let mut autofwd =
+        AutofwdProcess::start_with_options(&container, &[], &[("AUTOFWD_FORCE_SHELL", "1")])?;
+
+    // Collect events while waiting for ready
+    let (_ready, events) = autofwd.wait_for_event_collecting("ready", Duration::from_secs(15))?;
+
+    // Should see agent_fallback, NOT agent_deployed
+    let got_fallback = events
+        .iter()
+        .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("agent_fallback"));
+    let got_deployed = events
+        .iter()
+        .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("agent_deployed"));
+
+    assert!(
+        got_fallback,
+        "Should see agent_fallback with AUTOFWD_FORCE_SHELL. Events: {:?}",
+        events
+    );
+    assert!(
+        !got_deployed,
+        "Should NOT see agent_deployed with AUTOFWD_FORCE_SHELL. Events: {:?}",
+        events
+    );
+
+    // Check the fallback reason
+    let fallback_event = events
+        .iter()
+        .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("agent_fallback"))
+        .unwrap();
+    let reason = fallback_event.get("reason").and_then(|v| v.as_str());
+    assert!(
+        reason
+            .map(|r| r.contains("AUTOFWD_FORCE_SHELL"))
+            .unwrap_or(false),
+        "Fallback reason should mention AUTOFWD_FORCE_SHELL. Event: {:?}",
+        fallback_event
+    );
+
+    // Verify port forwarding still works in shell mode
+    container.start_listener(7777)?;
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(10))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(7777)
+    );
+
+    // In shell mode, process_name should be null (shell script can't detect it)
+    let process_name = event.get("process_name");
+    assert!(
+        process_name.is_none() || process_name == Some(&Value::Null),
+        "Shell fallback should NOT have process_name. Event: {:?}",
+        event
+    );
+
+    println!("Shell fallback mode working correctly - port forwarded without process name");
+
+    Ok(())
+}
+
+#[test]
+fn test_startup_timing() -> Result<()> {
+    // This test captures timing events to debug startup performance
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    // Start a listener first so there's something to detect
+    container.start_listener(9999)?;
+
+    let mut autofwd = AutofwdProcess::start(&container)?;
+
+    // Wait for forward_added (means first data was processed)
+    let (_fwd, events) =
+        autofwd.wait_for_event_collecting("forward_added", Duration::from_secs(30))?;
+
+    // Print all timing events
+    println!("\n=== Startup Timing ===");
+    for event in &events {
+        if event.get("event").and_then(|v| v.as_str()) == Some("timing") {
+            let phase = event.get("phase").and_then(|v| v.as_str()).unwrap_or("?");
+            let duration = event
+                .get("duration_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            println!("  {}: {}ms", phase, duration);
+        }
+    }
+    println!("======================\n");
+
+    // Also print non-timing events for context
+    println!("All events:");
+    for event in &events {
+        let event_type = event.get("event").and_then(|v| v.as_str()).unwrap_or("?");
+        println!("  {}: {:?}", event_type, event);
+    }
 
     Ok(())
 }

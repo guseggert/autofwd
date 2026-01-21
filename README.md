@@ -4,11 +4,13 @@ Automatic port forwarding for SSH sessions. Detects listening ports on a remote 
 
 ## Features
 
-- **Automatic detection** — monitors `/proc/net/tcp` on the remote host and forwards new ports as they appear
+- **Automatic detection** — monitors listening ports on the remote host and forwards them as they appear
+- **Process names** — shows which process owns each port (e.g., `node`, `python`, `nginx`)
 - **TUI interface** — view and manage forwarded ports in real-time
 - **Toggle forwards** — enable/disable individual port forwards without disconnecting
 - **Smart port mapping** — automatically finds free local ports when there's a collision
 - **SSH ControlMaster** — uses a single SSH connection for all operations
+- **Zero dependencies on remote** — works on any Linux server, no installation required
 
 ## Installation
 
@@ -19,7 +21,14 @@ Download the latest binary for your platform from [Releases](https://github.com/
 ### From source
 
 ```bash
-cargo install --path .
+# Install mise (or use cargo directly)
+brew install mise
+
+# Build with embedded agent binaries (requires Docker for cross-compilation)
+mise run build
+
+# Or for development (uses shell fallback, no cross-compilation needed)
+mise run build-dev
 ```
 
 ## Usage
@@ -79,16 +88,53 @@ autofwd myserver -- -i ~/.ssh/mykey -p 2222
 
 ## Requirements
 
-- Remote host must be Linux (reads `/proc/net/tcp`)
-- SSH access to the remote host
+- **Remote**: Linux (x86_64, aarch64, or armv7)
+- **Local**: SSH client with ControlMaster support
+- **Network**: SSH access to the remote host
 
 ## How it works
 
-1. Establishes an SSH ControlMaster connection to the remote host
-2. Runs a monitoring script that reads `/proc/net/tcp` and `/proc/net/tcp6` with server-side diffing (only sends data when ports change)
-3. Parses the output to detect listening ports owned by your user
-4. Uses SSH's `-O forward` to dynamically add port forwards through the ControlMaster
-5. Displays everything in a terminal UI
+autofwd uses a lightweight agent binary that runs on the remote server to monitor listening ports.
+
+### Architecture
+
+```
+┌─────────────────┐         SSH          ┌─────────────────┐
+│   Local (TUI)   │◄────────────────────►│  Remote Server  │
+│                 │                       │                 │
+│  - Display UI   │   ControlMaster      │  - Agent binary │
+│  - Manage fwds  │◄────────────────────►│  - Port monitor │
+│                 │   Port forwards      │  - Process info │
+└─────────────────┘                       └─────────────────┘
+```
+
+### Startup sequence
+
+1. **Connect** — Establishes an SSH ControlMaster connection
+2. **Deploy agent** — Uploads a small (~250KB) static binary to `/tmp/autofwd-agent-<hash>`
+3. **Monitor** — Agent runs `netstat` to detect listening ports and their owning processes
+4. **Forward** — Uses SSH's `-O forward` to dynamically add/remove port forwards
+5. **Display** — Shows everything in a terminal UI with real-time updates
+
+### Agent vs Shell fallback
+
+The TUI header shows the current monitoring mode:
+
+- **`[agent]`** (green) — Using the deployed agent binary. Full functionality including process names.
+- **`[shell]`** (yellow) — Fallback mode using a shell script. Port forwarding works, but process names are unavailable.
+
+The shell fallback is used when:
+- The remote architecture isn't supported (only x86_64, aarch64, armv7 Linux are bundled)
+- Agent deployment fails for any reason
+- Running a development build without compiled agents
+
+### Supported platforms
+
+| Remote OS | Architectures |
+|-----------|---------------|
+| Linux | x86_64, aarch64 (arm64), armv7 |
+
+The local machine can be any platform that supports Rust (macOS, Linux, Windows).
 
 ## License
 

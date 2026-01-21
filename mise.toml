@@ -4,30 +4,190 @@ rust = "latest"
 
 [tasks.run]
 description = "Run the CLI"
-run = "cargo run -- {{arg(name='args', var=true)}}"
+run = "cargo run -p autofwd -- {{arg(name='args', var=true)}}"
+
+[tasks.build-agents]
+description = "Cross-compile agent binaries for all Linux targets"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Check for cross
+if ! command -v cross &> /dev/null; then
+    echo "Installing cross..."
+    cargo install cross --git https://github.com/cross-rs/cross
+fi
+
+# Check for zstd
+if ! command -v zstd &> /dev/null; then
+    echo "Error: zstd not found. Install with: brew install zstd"
+    exit 1
+fi
+
+TARGETS=(
+    "x86_64-unknown-linux-musl"
+    "aarch64-unknown-linux-musl"
+    "armv7-unknown-linux-musleabihf"
+)
+
+mkdir -p target/agents
+
+for target in "${TARGETS[@]}"; do
+    echo "Building agent for $target..."
+    cross build --release --target "$target" -p autofwd-agent
+    
+    binary="target/$target/release/autofwd-agent"
+    
+    # Strip using the cross container
+    echo "Stripping $binary..."
+    docker run --rm -v "$(pwd):/work" -w /work "ghcr.io/cross-rs/$target:main" \
+        strip "$binary" 2>/dev/null || echo "Warning: could not strip $binary"
+    
+    # Compress with zstd
+    echo "Compressing..."
+    zstd -19 -f "$binary" -o "target/agents/$target.zst"
+done
+
+echo ""
+echo "Agent binaries built:"
+ls -lh target/agents/*.zst
+"""
+
+[tasks.build]
+description = "Build main autofwd binary (requires agents to be built first)"
+depends = ["build-agents"]
+run = "cargo build --release -p autofwd"
+
+[tasks.build-dev]
+description = "Build for development (with stub agents for testing)"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Create stub agent files if they don't exist (for development without cross-compiling)
+mkdir -p target/agents
+for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
+    if [ ! -f "target/agents/$target.zst" ]; then
+        echo "Creating stub for $target..."
+        echo "STUB" | zstd -o "target/agents/$target.zst"
+    fi
+done
+
+cargo build -p autofwd
+"""
 
 [tasks.test]
 description = "Run all tests"
 run = """
-docker build -t autofwd-test-ssh tests/docker
-cargo test -- --test-threads=1
+docker build -t autofwd-test-ssh crates/autofwd/tests/docker
+cargo test --workspace -- --test-threads=1
 """
 
 [tasks."test:unit"]
 description = "Run unit tests only"
-run = "cargo test --bins"
+run = "cargo test --workspace --lib"
 
 [tasks."test:e2e"]
 description = "Run E2E tests (requires Docker)"
 run = """
-docker build -t autofwd-test-ssh tests/docker
-cargo test --test e2e -- --test-threads=1
+docker build -t autofwd-test-ssh crates/autofwd/tests/docker
+cargo test --test e2e -p autofwd -- --test-threads=1
 """
 
 [tasks.lint]
 description = "Run lints"
-run = "cargo clippy -- -D warnings"
+run = "cargo clippy --workspace -- -D warnings"
 
 [tasks.fmt]
 description = "Format code"
-run = "cargo fmt"
+run = "cargo fmt --all"
+
+[tasks.clean-agents]
+description = "Remove built agent binaries"
+run = "rm -rf target/agents"
+
+[tasks."test:multiarch:setup"]
+description = "Set up QEMU for multi-arch Docker (one-time)"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Setting up QEMU for multi-architecture Docker support..."
+docker run --privileged --rm tonistiigi/binfmt --install all
+
+echo "QEMU setup complete. You can now run multi-arch containers."
+"""
+
+[tasks."test:multiarch"]
+description = "Run E2E tests on all architectures (requires build-agents first)"
+depends = ["build-agents"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLATFORMS=(
+    "linux/amd64:x86_64"
+    "linux/arm64:aarch64"
+    "linux/arm/v7:armv7"
+)
+
+echo "Building multi-arch test images..."
+
+for entry in "${PLATFORMS[@]}"; do
+    platform="${entry%%:*}"
+    arch="${entry##*:}"
+    
+    echo ""
+    echo "=========================================="
+    echo "Testing on $platform ($arch)"
+    echo "=========================================="
+    
+    # Build image for this platform
+    echo "Building test image for $platform..."
+    docker buildx build --platform "$platform" --load -t autofwd-test-ssh crates/autofwd/tests/docker
+    
+    # Run tests with this platform
+    echo "Running e2e tests..."
+    AUTOFWD_TEST_PLATFORM="$platform" cargo test --test e2e -p autofwd -- --test-threads=1
+    
+    echo "✓ $platform tests passed"
+done
+
+echo ""
+echo "=========================================="
+echo "All multi-arch tests passed!"
+echo "=========================================="
+"""
+
+[tasks."test:multiarch:amd64"]
+description = "Run E2E tests on linux/amd64"
+depends = ["build-agents"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+docker buildx build --platform linux/amd64 --load -t autofwd-test-ssh crates/autofwd/tests/docker
+AUTOFWD_TEST_PLATFORM="linux/amd64" cargo test --test e2e -p autofwd -- --test-threads=1
+"""
+
+[tasks."test:multiarch:arm64"]
+description = "Run E2E tests on linux/arm64"
+depends = ["build-agents"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+docker buildx build --platform linux/arm64 --load -t autofwd-test-ssh crates/autofwd/tests/docker
+AUTOFWD_TEST_PLATFORM="linux/arm64" cargo test --test e2e -p autofwd -- --test-threads=1
+"""
+
+[tasks."test:multiarch:armv7"]
+description = "Run E2E tests on linux/arm/v7"
+depends = ["build-agents"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+docker buildx build --platform linux/arm/v7 --load -t autofwd-test-ssh crates/autofwd/tests/docker
+AUTOFWD_TEST_PLATFORM="linux/arm/v7" cargo test --test e2e -p autofwd -- --test-threads=1
+"""

@@ -1,0 +1,28 @@
+[package]
+name = "autofwd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cursor-style auto port forwarding for SSH sessions"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
+humantime = "2"
+ratatui = "0.29"
+tokio = { version = "1", features = ["full"] }
+zstd = "0.13"
+
+[build-dependencies]
+blake3 = "1"
+
+[dev-dependencies]
+rand = "0.8"
+tempfile = "3"
