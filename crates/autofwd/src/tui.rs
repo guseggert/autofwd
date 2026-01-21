@@ -451,7 +451,7 @@ pub async fn run_tui(
     let mut tui = Tui::new()?;
     let mut ui = UiState {
         show_help: false,
-        show_events: true, // Events visible by default
+        show_events: false, // Events hidden by default
         show_quit_confirm: false,
         table_state: TableState::default(),
     };
