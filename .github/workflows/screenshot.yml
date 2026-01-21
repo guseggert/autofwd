@@ -73,9 +73,10 @@ jobs:
           sleep 3
 
           # Mock services with fake process names (use nohup to keep running)
-          docker exec -d demo sh -c 'cp /usr/bin/nc /tmp/python3; while true; do echo -e "HTTP/1.1 200 OK\r\n\r\nHello" | /tmp/python3 -l -p 3000 -q 1 2>/dev/null; done'
-          docker exec -d demo sh -c 'cp /usr/bin/nc /tmp/postgres; while true; do /tmp/postgres -l -p 5432 -q 1 2>/dev/null; done'
-          docker exec -d demo sh -c 'cp /usr/bin/nc /tmp/redis-server; while true; do echo "+PONG" | /tmp/redis-server -l -p 6379 -q 1 2>/dev/null; done'
+          # Use dev server ports that aren't in the default denylist
+          docker exec -d demo sh -c 'cp /usr/bin/nc /tmp/node; while true; do echo -e "HTTP/1.1 200 OK\r\n\r\nHello" | /tmp/node -l -p 3000 -q 1 2>/dev/null; done'
+          docker exec -d demo sh -c 'cp /usr/bin/nc /tmp/python3; while true; do echo -e "HTTP/1.1 200 OK\r\n\r\nHello" | /tmp/python3 -l -p 8000 -q 1 2>/dev/null; done'
+          docker exec -d demo sh -c 'cp /usr/bin/nc /tmp/vite; while true; do echo -e "HTTP/1.1 200 OK\r\n\r\nHello" | /tmp/vite -l -p 5173 -q 1 2>/dev/null; done'
 
           sleep 3
           
