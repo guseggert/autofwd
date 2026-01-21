@@ -3,19 +3,22 @@
 
 # Output settings
 Output docs/demo.gif
-Set Width 100
-Set Height 20
+Set Width 120
+Set Height 25
 Set FontSize 14
 Set Theme "Dracula"
 Set Padding 10
 Set TypingSpeed 50ms
 
-# Start autofwd connecting to demo server
-Type "autofwd testuser@localhost -p 2222"
+# Set shell to bash with proper environment
+Set Shell "bash"
+
+# Start autofwd connecting to demo server with explicit SSH options
+Type "autofwd testuser@localhost -- -p 2222 -i /tmp/demo_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 Enter
 
 # Wait for connection and port detection
-Sleep 4s
+Sleep 5s
 
 # Navigate down to select PostgreSQL port (row 2)
 Down
