@@ -35,9 +35,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -47,15 +44,19 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-demo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build agents
-        run: |
-          mkdir -p target/agents
-          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
-            echo "Building agent for $target..."
-            cross build --release --target "$target" -p autofwd-agent
-            zstd -19 -f "target/$target/release/autofwd-agent" -o "target/agents/$target.zst"
-          done
-          ls -lh target/agents/
+      # Download pre-built agents from the Tests workflow
+      - name: Download agents from Tests workflow
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          workflow: test.yml
+          name: agents
+          path: target/agents/
+          branch: main
+          check_artifacts: true
+          search_artifacts: true
+
+      - name: Verify agents
+        run: ls -lh target/agents/
 
       - name: Build autofwd
         run: cargo build --release -p autofwd
