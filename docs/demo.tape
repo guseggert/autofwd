@@ -5,10 +5,12 @@
 Output docs/demo.gif
 Set Width 120
 Set Height 25
-Set FontSize 14
+Set FontSize 18
+Set FontFamily "DejaVu Sans Mono"
 Set Theme "Dracula"
-Set Padding 10
+Set Padding 20
 Set TypingSpeed 50ms
+Set Framerate 24
 
 # Set shell to bash with proper environment
 Set Shell "bash"
