@@ -45,7 +45,7 @@ jobs:
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
             echo "Building agent for $target..."
             cross build --release --target "$target" -p autofwd-agent
-            zstd -19 "target/$target/release/autofwd-agent" -o "target/agents/$target.zst"
+            zstd -19 -f "target/$target/release/autofwd-agent" -o "target/agents/$target.zst"
           done
           ls -lh target/agents/
 
