@@ -14,30 +14,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core chromium-browser
-
-      - name: Install ttyd
-        run: |
-          TTYD_VERSION="1.7.7"
-          wget -q "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64" -O ttyd
-          chmod +x ttyd
-          sudo mv ttyd /usr/local/bin/
-          ttyd --version
-
-      - name: Install VHS
-        run: |
-          VHS_VERSION="0.8.0"
-          wget -qO- "https://github.com/charmbracelet/vhs/releases/download/v${VHS_VERSION}/vhs_${VHS_VERSION}_Linux_x86_64.tar.gz" | tar xz
-          sudo mv vhs_${VHS_VERSION}_Linux_x86_64/vhs /usr/local/bin/
-          vhs --version
-
-      # Download pre-built autofwd binary (already has agents embedded)
+      # Download pre-built autofwd binary
       - name: Download autofwd binary
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -48,11 +26,12 @@ jobs:
           check_artifacts: true
           search_artifacts: true
 
-      - name: Extract and install autofwd
+      - name: Extract autofwd
         run: |
           tar xzf autofwd-x86_64-unknown-linux-gnu.tar.gz
           chmod +x autofwd
-          ./autofwd --help
+          sudo mv autofwd /usr/local/bin/
+          autofwd --help
 
       - name: Build test Docker image
         run: docker build -t autofwd-test-ssh crates/autofwd/tests/docker
@@ -60,86 +39,35 @@ jobs:
       - name: Generate SSH key
         run: |
           ssh-keygen -t ed25519 -f /tmp/demo_key -N ""
-          cat /tmp/demo_key.pub
 
       - name: Start demo container with mock services
         run: |
-          # Start container
           docker run -d \
             --name demo \
             -p 2222:22 \
             -v /tmp/demo_key.pub:/home/testuser/.ssh/authorized_keys:ro \
             autofwd-test-ssh
 
-          # Wait for SSH to be ready
           sleep 3
 
-          # Copy netcat to fake process names and start services
-          # HTTP "server" (python3)
-          docker exec demo sh -c '
-            cp /usr/bin/nc /tmp/python3
-            while true; do 
-              echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello" | /tmp/python3 -l -p 3000 -q 1 2>/dev/null
-            done &
-          '
+          # Mock services with fake process names
+          docker exec demo sh -c 'cp /usr/bin/nc /tmp/python3; while true; do echo -e "HTTP/1.1 200 OK\r\n\r\nHello" | /tmp/python3 -l -p 3000 -q 1 2>/dev/null; done &'
+          docker exec demo sh -c 'cp /usr/bin/nc /tmp/postgres; while true; do /tmp/postgres -l -p 5432 -q 1 2>/dev/null; done &'
+          docker exec demo sh -c 'cp /usr/bin/nc /tmp/redis-server; while true; do echo "+PONG" | /tmp/redis-server -l -p 6379 -q 1 2>/dev/null; done &'
 
-          # PostgreSQL mock (postgres)
-          docker exec demo sh -c '
-            cp /usr/bin/nc /tmp/postgres
-            while true; do
-              /tmp/postgres -l -p 5432 -q 1 2>/dev/null
-            done &
-          '
-
-          # Redis mock (redis-server)
-          docker exec demo sh -c '
-            cp /usr/bin/nc /tmp/redis-server
-            while true; do 
-              echo "+PONG" | /tmp/redis-server -l -p 6379 -q 1 2>/dev/null
-            done &
-          '
-
-          # Verify services are running
           sleep 2
-          docker exec demo netstat -tlnp || true
 
-      - name: Configure SSH
-        run: |
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          cat > ~/.ssh/config << 'EOF'
-          Host localhost
-            StrictHostKeyChecking no
-            UserKnownHostsFile /dev/null
-            IdentityFile /tmp/demo_key
-            LogLevel ERROR
-          EOF
-          chmod 600 ~/.ssh/config
+      - name: Run VHS
+        uses: charmbracelet/vhs-action@v2
+        with:
+          path: docs/demo.tape
 
-      - name: Test SSH connection
-        run: |
-          ssh -p 2222 testuser@localhost "echo 'SSH connection successful'"
-
-      - name: Generate demo GIF
-        run: |
-          # Run VHS with autofwd in current directory
-          PATH="$PWD:$PATH" vhs docs/demo.tape
-          
-          # Verify output
-          ls -lh docs/demo.gif
-
-      - name: Cleanup container
+      - name: Cleanup
         if: always()
         run: docker rm -f demo || true
 
       - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/demo.gif
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "docs: update demo GIF [skip ci]"
-            git push
-          fi
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "docs: update demo GIF [skip ci]"
+          file_pattern: "docs/*.gif"
