@@ -15,7 +15,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg zstd
+          sudo apt-get install -y ffmpeg
 
       - name: Install ttyd
         run: |
@@ -32,34 +32,22 @@ jobs:
           sudo mv vhs_${VHS_VERSION}_Linux_x86_64/vhs /usr/local/bin/
           vhs --version
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/
-            ~/.cargo/git/
-            target/
-          key: ${{ runner.os }}-cargo-demo-${{ hashFiles('**/Cargo.lock') }}
-
-      # Download pre-built agents from the Tests workflow
-      - name: Download agents from Tests workflow
+      # Download pre-built autofwd binary (already has agents embedded)
+      - name: Download autofwd binary
         uses: dawidd6/action-download-artifact@v6
         with:
-          workflow: test.yml
-          name: agents
-          path: target/agents/
+          workflow: release.yml
+          name: autofwd-x86_64-unknown-linux-gnu
+          path: .
           branch: main
           check_artifacts: true
           search_artifacts: true
 
-      - name: Verify agents
-        run: ls -lh target/agents/
-
-      - name: Build autofwd
-        run: cargo build --release -p autofwd
+      - name: Extract and install autofwd
+        run: |
+          tar xzf autofwd-x86_64-unknown-linux-gnu.tar.gz
+          chmod +x autofwd
+          ./autofwd --help
 
       - name: Build test Docker image
         run: docker build -t autofwd-test-ssh crates/autofwd/tests/docker
@@ -129,11 +117,8 @@ jobs:
 
       - name: Generate demo GIF
         run: |
-          # Add the built binary to PATH
-          export PATH="$PWD/target/release:$PATH"
-          
-          # Run VHS
-          vhs docs/demo.tape
+          # Run VHS with autofwd in current directory
+          PATH="$PWD:$PATH" vhs docs/demo.tape
           
           # Verify output
           ls -lh docs/demo.gif
