@@ -176,25 +176,26 @@ async fn main() -> Result<()> {
     } else {
         // TUI mode: spawn signal handler and run TUI
         let signal_state = tui_state.clone();
+        let signal_notify = redraw_notify.clone();
         tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        signal_state.write().await.quit_requested = true;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    signal_state.write().await.should_quit = true;
+                    signal_notify.notify_one(); // Wake up TUI to check should_quit
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    {
+                        let mut term = tokio::signal::unix::signal(
+                            tokio::signal::unix::SignalKind::terminate()
+                        ).unwrap();
+                        term.recv().await
                     }
-                    _ = async {
-                        #[cfg(unix)]
-                        {
-                            let mut term = tokio::signal::unix::signal(
-                                tokio::signal::unix::SignalKind::terminate()
-                            ).unwrap();
-                            term.recv().await
-                        }
-                        #[cfg(not(unix))]
-                        std::future::pending::<()>().await
-                    } => {
-                        signal_state.write().await.quit_requested = true;
-                    }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await
+                } => {
+                    signal_state.write().await.should_quit = true;
+                    signal_notify.notify_one(); // Wake up TUI to check should_quit
                 }
             }
         });

@@ -7,7 +7,9 @@ use crossterm::{
 use futures::StreamExt;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    },
 };
 use std::io::{stdout, Stdout};
 use std::sync::Arc;
@@ -17,7 +19,7 @@ use tokio::sync::{mpsc, RwLock};
 use crate::events::Event as JsonEvent;
 use crate::probe::Protocol;
 
-const MAX_EVENTS: usize = 5;
+const MAX_EVENTS: usize = 1000;
 
 /// A forwarded port entry for display.
 #[derive(Clone, Debug)]
@@ -57,9 +59,8 @@ pub struct TuiState {
     pub status: String,
     pub forwarded: Vec<ForwardedPort>,
     pub should_quit: bool,
-    pub quit_requested: bool, // Set by Ctrl+C to trigger confirmation
     pub selected: usize,
-    pub events: Vec<String>,
+    pub events: Vec<JsonEvent>,
     /// Current monitoring mode (agent or shell fallback).
     pub monitor_mode: MonitorModeDisplay,
     /// Optional channel for JSON events (headless mode)
@@ -68,18 +69,19 @@ pub struct TuiState {
 }
 
 impl TuiState {
-    /// Add an event to the log (keeps last MAX_EVENTS).
-    pub fn push_event(&mut self, event: String) {
-        use chrono::Local;
-
-        let timestamp = Local::now().format("%H:%M:%S").to_string();
-        self.events.push(format!("{} {}", timestamp, event));
+    /// Add an event to the log (keeps last MAX_EVENTS) and emit it.
+    pub fn push_event(&mut self, event: JsonEvent) {
+        // Also emit for headless mode JSON output
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event.clone());
+        }
+        self.events.push(event);
         if self.events.len() > MAX_EVENTS {
             self.events.remove(0);
         }
     }
 
-    /// Emit a structured event (for headless mode JSON output).
+    /// Emit a structured event (for headless mode JSON output only, not stored).
     pub fn emit(&self, event: JsonEvent) {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(event);
@@ -91,9 +93,15 @@ impl TuiState {
 #[derive(Debug, Default)]
 struct UiState {
     show_help: bool,
-    show_events: bool,
+    show_process: bool,
     show_quit_confirm: bool,
     table_state: TableState,
+    // Events view state
+    events_view: bool,
+    events_list_state: ListState,
+    events_filter: String,
+    events_filter_active: bool,
+    events_auto_follow: bool,
 }
 
 pub type SharedState = Arc<RwLock<TuiState>>;
@@ -122,7 +130,6 @@ pub fn new_shared_state(event_tx: Option<EventSender>) -> (SharedState, RedrawNo
         status: "connecting...".to_string(),
         forwarded: Vec::new(),
         should_quit: false,
-        quit_requested: false,
         selected: 0,
         events: Vec::new(),
         monitor_mode: MonitorModeDisplay::Unknown,
@@ -167,143 +174,21 @@ impl Tui {
         self.terminal.draw(|frame| {
             let area = frame.area();
 
-            // Calculate events height (only show if toggled on and there are events)
-            let events_height = if ui.show_events && !state.events.is_empty() {
-                (state.events.len() as u16 + 2).min(MAX_EVENTS as u16 + 2)
+            if ui.events_view {
+                // Full-screen events view
+                render_events_view(frame, area, state, ui);
             } else {
-                0
-            };
+                // Main view
+                render_main_view(frame, area, state, ui, target);
 
-            // Layout: header, main content, events (optional), footer
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),             // Header
-                    Constraint::Min(5),                // Table
-                    Constraint::Length(events_height), // Events (0 if hidden)
-                    Constraint::Length(3),             // Footer
-                ])
-                .split(area);
+                // Render overlays on top
+                if ui.show_help {
+                    render_help_overlay(frame, area);
+                }
 
-            // Header with monitor mode indicator (right-aligned)
-            let (mode_text, mode_style) = match state.monitor_mode {
-                MonitorModeDisplay::Agent => ("[agent]", Style::default().fg(Color::Green)),
-                MonitorModeDisplay::Shell => ("[shell]", Style::default().fg(Color::Yellow)),
-                MonitorModeDisplay::Unknown => ("", Style::default()),
-            };
-            let left_text = format!(" {} - {}", target, state.status);
-            // Calculate padding to push mode indicator to the right
-            // chunks[0].width - 2 (borders) - left_text.len() - mode_text.len() - 1 (right padding)
-            let available_width = chunks[0].width.saturating_sub(2) as usize;
-            let padding_len = available_width
-                .saturating_sub(left_text.len())
-                .saturating_sub(mode_text.len())
-                .saturating_sub(1);
-            let header_line = Line::from(vec![
-                Span::raw(left_text),
-                Span::raw(" ".repeat(padding_len)),
-                Span::styled(mode_text, mode_style),
-            ]);
-            let header = Paragraph::new(header_line)
-                .block(Block::default().borders(Borders::ALL).title(" autofwd "));
-            frame.render_widget(header, chunks[0]);
-
-            // Forwarded ports table
-            let header_row = Row::new(vec![
-                Cell::from(" "),
-                Cell::from("Remote"),
-                Cell::from("Local"),
-                Cell::from("Process"),
-                Cell::from("Address"),
-                Cell::from("Age"),
-            ])
-            .style(Style::default().fg(Color::Yellow).bold());
-
-            let rows: Vec<Row> = state
-                .forwarded
-                .iter()
-                .map(|fwd| {
-                    let age = fwd.forwarded_at.elapsed();
-                    let age_str = format_duration(age);
-                    let status_icon = if fwd.enabled { "●" } else { "○" };
-                    let process = fwd.process_name.as_deref().unwrap_or("-");
-                    let style = if fwd.enabled {
-                        Style::default()
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
-                    Row::new(vec![
-                        Cell::from(status_icon),
-                        Cell::from(format!(":{}", fwd.remote_port)),
-                        Cell::from(format!(":{}", fwd.local_port)),
-                        Cell::from(process),
-                        Cell::from(if fwd.enabled {
-                            fwd.protocol.format_address(fwd.local_port)
-                        } else {
-                            "(disabled)".to_string()
-                        }),
-                        Cell::from(age_str),
-                    ])
-                    .style(style)
-                })
-                .collect();
-
-            let table = Table::new(
-                rows,
-                [
-                    Constraint::Length(3),
-                    Constraint::Length(10),
-                    Constraint::Length(10),
-                    Constraint::Length(15),
-                    Constraint::Min(25),
-                    Constraint::Length(10),
-                ],
-            )
-            .header(header_row)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Forwarded Ports "),
-            )
-            .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-            .highlight_symbol("→ ");
-            frame.render_stateful_widget(table, chunks[1], &mut ui.table_state);
-
-            // Events log (only if toggled on and there are events)
-            if ui.show_events && !state.events.is_empty() {
-                let items: Vec<ListItem> = state
-                    .events
-                    .iter()
-                    .map(|e| {
-                        ListItem::new(format!(" {}", e)).style(Style::default().fg(Color::Cyan))
-                    })
-                    .collect();
-                let events_list = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(" Events "));
-                frame.render_widget(events_list, chunks[2]);
-            }
-
-            // Footer
-            let events_indicator = if ui.show_events {
-                "e:events ✓"
-            } else {
-                "e:events"
-            };
-            let footer = Paragraph::new(format!(
-                " ↑/↓ navigate • space toggle • {} • ?:help • q quit",
-                events_indicator
-            ))
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default().borders(Borders::ALL));
-            frame.render_widget(footer, chunks[3]);
-
-            // Render overlays on top
-            if ui.show_help {
-                render_help_overlay(frame, area);
-            }
-
-            if ui.show_quit_confirm {
-                render_quit_confirm(frame, area);
+                if ui.show_quit_confirm {
+                    render_quit_confirm(frame, area);
+                }
             }
         })?;
         Ok(())
@@ -314,6 +199,240 @@ impl Drop for Tui {
     fn drop(&mut self) {
         let _ = self.restore();
     }
+}
+
+/// Render the main ports view.
+fn render_main_view(
+    frame: &mut Frame,
+    area: Rect,
+    state: &TuiState,
+    ui: &mut UiState,
+    target: &str,
+) {
+    // Layout: header, main content, footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(5),    // Table
+            Constraint::Length(3), // Footer
+        ])
+        .split(area);
+
+    // Header with monitor mode indicator (right-aligned)
+    let (mode_text, mode_style) = match state.monitor_mode {
+        MonitorModeDisplay::Agent => ("[agent]", Style::default().fg(Color::Green)),
+        MonitorModeDisplay::Shell => ("[shell]", Style::default().fg(Color::Yellow)),
+        MonitorModeDisplay::Unknown => ("", Style::default()),
+    };
+    let left_text = format!(" {} - {}", target, state.status);
+    let available_width = chunks[0].width.saturating_sub(2) as usize;
+    let padding_len = available_width
+        .saturating_sub(left_text.len())
+        .saturating_sub(mode_text.len())
+        .saturating_sub(1);
+    let header_line = Line::from(vec![
+        Span::raw(left_text),
+        Span::raw(" ".repeat(padding_len)),
+        Span::styled(mode_text, mode_style),
+    ]);
+    let header = Paragraph::new(header_line)
+        .block(Block::default().borders(Borders::ALL).title(" autofwd "));
+    frame.render_widget(header, chunks[0]);
+
+    // Forwarded ports table
+    let header_cells: Vec<Cell> = if ui.show_process {
+        vec![
+            Cell::from(" "),
+            Cell::from("Remote"),
+            Cell::from("Local"),
+            Cell::from("Process"),
+            Cell::from("Address"),
+            Cell::from("Age"),
+        ]
+    } else {
+        vec![
+            Cell::from(" "),
+            Cell::from("Remote"),
+            Cell::from("Local"),
+            Cell::from("Address"),
+            Cell::from("Age"),
+        ]
+    };
+    let header_row = Row::new(header_cells).style(Style::default().fg(Color::Yellow).bold());
+
+    let rows: Vec<Row> = state
+        .forwarded
+        .iter()
+        .map(|fwd| {
+            let age = fwd.forwarded_at.elapsed();
+            let age_str = format_duration(age);
+            let status_icon = if fwd.enabled { "●" } else { "○" };
+            let style = if fwd.enabled {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let address = if fwd.enabled {
+                fwd.protocol.format_address(fwd.local_port)
+            } else {
+                "(disabled)".to_string()
+            };
+            let cells: Vec<Cell> = if ui.show_process {
+                let process = fwd.process_name.as_deref().unwrap_or("-");
+                vec![
+                    Cell::from(status_icon),
+                    Cell::from(format!(":{}", fwd.remote_port)),
+                    Cell::from(format!(":{}", fwd.local_port)),
+                    Cell::from(process),
+                    Cell::from(address),
+                    Cell::from(age_str),
+                ]
+            } else {
+                vec![
+                    Cell::from(status_icon),
+                    Cell::from(format!(":{}", fwd.remote_port)),
+                    Cell::from(format!(":{}", fwd.local_port)),
+                    Cell::from(address),
+                    Cell::from(age_str),
+                ]
+            };
+            Row::new(cells).style(style)
+        })
+        .collect();
+
+    let widths: Vec<Constraint> = if ui.show_process {
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(15),
+            Constraint::Min(25),
+            Constraint::Length(10),
+        ]
+    } else {
+        vec![
+            Constraint::Length(3),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(25),
+            Constraint::Length(10),
+        ]
+    };
+    let table = Table::new(rows, widths)
+        .header(header_row)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Forwarded Ports "),
+        )
+        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("→ ");
+    frame.render_stateful_widget(table, chunks[1], &mut ui.table_state);
+
+    // Footer
+    let footer = Paragraph::new(" ↑/↓ navigate • space toggle • ? help • q quit")
+        .style(Style::default().fg(Color::DarkGray))
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(footer, chunks[2]);
+}
+
+/// Render the full-screen events view.
+fn render_events_view(frame: &mut Frame, area: Rect, state: &TuiState, ui: &mut UiState) {
+    // Layout: header with filter, events list, footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header/filter
+            Constraint::Min(5),    // Events list
+            Constraint::Length(3), // Footer
+        ])
+        .split(area);
+
+    // Filter events
+    let filtered_events: Vec<_> = if ui.events_filter.is_empty() {
+        state.events.iter().collect()
+    } else {
+        let filter_lower = ui.events_filter.to_lowercase();
+        state
+            .events
+            .iter()
+            .filter(|e| format_event(e).to_lowercase().contains(&filter_lower))
+            .collect()
+    };
+
+    let total_events = filtered_events.len();
+
+    // Header with filter input and count
+    let filter_display = if ui.events_filter.is_empty() {
+        if ui.events_filter_active {
+            "filter: _".to_string()
+        } else {
+            format!("{} events", total_events)
+        }
+    } else {
+        format!(
+            "filter: {}{} ({} matches)",
+            ui.events_filter,
+            if ui.events_filter_active { "_" } else { "" },
+            total_events
+        )
+    };
+    let header = Paragraph::new(format!(" {}", filter_display))
+        .block(Block::default().borders(Borders::ALL).title(" Events "));
+    frame.render_widget(header, chunks[0]);
+
+    // Build list items
+    let items: Vec<ListItem> = filtered_events
+        .iter()
+        .map(|e| {
+            ListItem::new(format!(" {}", format_event(e))).style(Style::default().fg(Color::Cyan))
+        })
+        .collect();
+
+    // Handle selection
+    if total_events == 0 {
+        ui.events_list_state.select(None);
+    } else if ui.events_auto_follow {
+        // Auto-follow: always select the last item
+        ui.events_list_state.select(Some(total_events - 1));
+    } else {
+        // Clamp selection to valid range
+        let selected = ui.events_list_state.selected().unwrap_or(0);
+        if selected >= total_events {
+            ui.events_list_state.select(Some(total_events - 1));
+        }
+    }
+
+    // Show position indicator in title (with auto-follow indicator)
+    let position_info = if total_events > 0 {
+        let selected = ui.events_list_state.selected().unwrap_or(0) + 1;
+        let follow_indicator = if ui.events_auto_follow { " auto" } else { "" };
+        format!(" [{}/{}{}] ", selected, total_events, follow_indicator)
+    } else {
+        String::new()
+    };
+
+    let events_list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Log{}", position_info)),
+        )
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol("→ ");
+    frame.render_stateful_widget(events_list, chunks[1], &mut ui.events_list_state);
+
+    // Footer with controls
+    let footer_text = if ui.events_filter_active {
+        " Type to filter • Enter confirm • Esc cancel"
+    } else {
+        " ↑/↓ scroll • / filter • e/Esc close"
+    };
+    let footer = Paragraph::new(footer_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(footer, chunks[2]);
 }
 
 /// Render a centered popup.
@@ -333,7 +452,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "  ↑/k/^P   Move selection up",
         "  ↓/j/^N   Move selection down",
         "  Space    Toggle port forwarding",
-        "  e        Toggle events log",
+        "  p        Toggle process column",
+        "  e        Open events view",
         "  ?        Show/hide this help",
         "  q/Esc    Quit (with confirmation)",
         "",
@@ -392,6 +512,100 @@ fn format_duration(d: Duration) -> String {
         format!("{}m {}s", secs / 60, secs % 60)
     } else {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Format a JSON event for display in the TUI event log.
+fn format_event(event: &JsonEvent) -> String {
+    use crate::events::Event;
+
+    match event {
+        Event::ForwardAdded {
+            ts,
+            remote_port,
+            local_port,
+            ..
+        } => {
+            if remote_port == local_port {
+                format!("{} + forwarded :{}", ts.to_rfc3339(), remote_port)
+            } else {
+                format!(
+                    "{} + forwarded :{} → :{}",
+                    ts.to_rfc3339(),
+                    remote_port,
+                    local_port
+                )
+            }
+        }
+        Event::ProtocolDetected {
+            ts,
+            local_port,
+            protocol,
+        } => format!(
+            "{} ~ detected {} on :{}",
+            ts.to_rfc3339(),
+            protocol,
+            local_port
+        ),
+        Event::ForwardRemoved { ts, remote_port } => {
+            format!("{} - removed :{}", ts.to_rfc3339(), remote_port)
+        }
+        Event::ForwardDisabled { ts, remote_port } => {
+            format!("{} ○ disabled :{}", ts.to_rfc3339(), remote_port)
+        }
+        Event::ForwardEnabled {
+            ts,
+            remote_port,
+            local_port,
+        } => {
+            if remote_port == local_port {
+                format!("{} ● enabled :{}", ts.to_rfc3339(), remote_port)
+            } else {
+                format!(
+                    "{} ● enabled :{} → :{}",
+                    ts.to_rfc3339(),
+                    remote_port,
+                    local_port
+                )
+            }
+        }
+        Event::ConnectionLost { ts } => {
+            format!("{} ! connection lost", ts.to_rfc3339())
+        }
+        Event::Reconnecting { ts, delay_ms } => {
+            format!("{} ! reconnecting in {}ms", ts.to_rfc3339(), delay_ms)
+        }
+        Event::Reconnected { ts } => {
+            format!("{} ✓ reconnected", ts.to_rfc3339())
+        }
+        Event::ServiceRestarted { ts, remote_port } => {
+            format!("{} ↻ service restarted :{}", ts.to_rfc3339(), remote_port)
+        }
+        Event::Error { ts, message } => {
+            format!("{} ✗ {}", ts.to_rfc3339(), message)
+        }
+        Event::Ready { ts, target } => {
+            format!("{} ✓ ready: {}", ts.to_rfc3339(), target)
+        }
+        Event::Shutdown { ts } => {
+            format!("{} shutdown", ts.to_rfc3339())
+        }
+        Event::AgentDeploying { ts, arch } => {
+            format!("{} deploying agent ({})", ts.to_rfc3339(), arch)
+        }
+        Event::AgentDeployed { ts, arch, .. } => {
+            format!("{} ✓ agent deployed ({})", ts.to_rfc3339(), arch)
+        }
+        Event::AgentFallback { ts, reason } => {
+            format!("{} ! {}", ts.to_rfc3339(), reason)
+        }
+        Event::Timing {
+            ts,
+            phase,
+            duration_ms,
+        } => {
+            format!("{} [timing] {} {}ms", ts.to_rfc3339(), phase, duration_ms)
+        }
     }
 }
 
@@ -456,9 +670,14 @@ pub async fn run_tui(
     let mut tui = Tui::new()?;
     let mut ui = UiState {
         show_help: false,
-        show_events: false, // Events hidden by default
+        show_process: false, // Process column hidden by default
         show_quit_confirm: false,
         table_state: TableState::default(),
+        events_view: false,
+        events_list_state: ListState::default(),
+        events_filter: String::new(),
+        events_filter_active: false,
+        events_auto_follow: true,
     };
 
     // Unified event channel - all events flow through here
@@ -472,17 +691,9 @@ pub async fn run_tui(
 
     // Main event loop - simple recv from unified channel
     while let Some(event) = events.recv().await {
-        // Check for quit/quit_requested from monitor
-        {
-            let s = state.read().await;
-            if s.should_quit {
-                break;
-            }
-            if s.quit_requested {
-                drop(s);
-                state.write().await.quit_requested = false;
-                ui.show_quit_confirm = true;
-            }
+        // Check for quit (set by Ctrl+C signal handler)
+        if state.read().await.should_quit {
+            break;
         }
 
         match event {
@@ -512,6 +723,12 @@ async fn handle_key_event(
     ui: &mut UiState,
     cmd_tx: &CommandSender,
 ) {
+    // Ctrl+C quits immediately from anywhere
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        state.write().await.should_quit = true;
+        return;
+    }
+
     // Handle quit confirmation dialog
     if ui.show_quit_confirm {
         match key.code {
@@ -532,7 +749,13 @@ async fn handle_key_event(
         return;
     }
 
-    // Normal key handling
+    // Events view has its own key handling
+    if ui.events_view {
+        handle_events_view_keys(key, state, ui).await;
+        return;
+    }
+
+    // Normal key handling (main view)
     let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     if is_ctrl {
@@ -561,7 +784,13 @@ async fn handle_key_event(
                 ui.show_help = true;
             }
             KeyCode::Char('e') | KeyCode::Char('E') => {
-                ui.show_events = !ui.show_events;
+                // Open events view with auto-follow enabled
+                ui.events_view = true;
+                ui.events_auto_follow = true;
+                // Selection will be set to last event by render_events_view
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                ui.show_process = !ui.show_process;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let mut s = state.write().await;
@@ -586,5 +815,119 @@ async fn handle_key_event(
             }
             _ => {}
         }
+    }
+}
+
+/// Handle keyboard input in the events view.
+async fn handle_events_view_keys(key: KeyEvent, state: &SharedState, ui: &mut UiState) {
+    // If filter is active, handle text input
+    if ui.events_filter_active {
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel filter, clear it
+                ui.events_filter_active = false;
+                ui.events_filter.clear();
+                // Re-enable auto-follow when clearing filter
+                ui.events_auto_follow = true;
+            }
+            KeyCode::Enter => {
+                // Confirm filter
+                ui.events_filter_active = false;
+            }
+            KeyCode::Backspace => {
+                ui.events_filter.pop();
+                // Reset to auto-follow when filter changes
+                ui.events_auto_follow = true;
+            }
+            KeyCode::Char(c) => {
+                ui.events_filter.push(c);
+                // Reset to auto-follow when filter changes
+                ui.events_auto_follow = true;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    let total = get_filtered_event_count(state, ui).await;
+
+    // Normal events view navigation
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Char('q') => {
+            // Close events view
+            ui.events_view = false;
+            ui.events_filter.clear();
+            ui.events_list_state.select(None);
+            ui.events_auto_follow = true; // Reset for next open
+        }
+        KeyCode::Char('/') => {
+            // Start filtering
+            ui.events_filter_active = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            // Moving up disables auto-follow
+            ui.events_auto_follow = false;
+            let selected = ui.events_list_state.selected().unwrap_or(0);
+            if selected > 0 {
+                ui.events_list_state.select(Some(selected - 1));
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let selected = ui.events_list_state.selected().unwrap_or(0);
+            if total > 0 && selected < total - 1 {
+                ui.events_list_state.select(Some(selected + 1));
+                // If we reached the last item, re-enable auto-follow
+                if selected + 1 == total - 1 {
+                    ui.events_auto_follow = true;
+                }
+            }
+        }
+        KeyCode::PageUp => {
+            // Moving up disables auto-follow
+            ui.events_auto_follow = false;
+            let selected = ui.events_list_state.selected().unwrap_or(0);
+            ui.events_list_state
+                .select(Some(selected.saturating_sub(10)));
+        }
+        KeyCode::PageDown => {
+            let selected = ui.events_list_state.selected().unwrap_or(0);
+            if total > 0 {
+                let new_selected = (selected + 10).min(total - 1);
+                ui.events_list_state.select(Some(new_selected));
+                // If we reached the last item, re-enable auto-follow
+                if new_selected == total - 1 {
+                    ui.events_auto_follow = true;
+                }
+            }
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            // Moving to start disables auto-follow
+            ui.events_auto_follow = false;
+            if total > 0 {
+                ui.events_list_state.select(Some(0));
+            }
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            // Moving to end enables auto-follow
+            ui.events_auto_follow = true;
+            if total > 0 {
+                ui.events_list_state.select(Some(total - 1));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Get the count of events matching the current filter.
+async fn get_filtered_event_count(state: &SharedState, ui: &UiState) -> usize {
+    let s = state.read().await;
+    if ui.events_filter.is_empty() {
+        s.events.len()
+    } else {
+        let filter_lower = ui.events_filter.to_lowercase();
+        s.events
+            .iter()
+            .filter(|e| format_event(e).to_lowercase().contains(&filter_lower))
+            .count()
     }
 }

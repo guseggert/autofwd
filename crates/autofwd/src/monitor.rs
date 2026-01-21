@@ -165,8 +165,7 @@ async fn process_snapshot(
                 } else {
                     None
                 };
-                tui.push_event(format!("↻ service restarted :{}", remote_port));
-                tui.emit(Event::service_restarted(remote_port));
+                tui.push_event(Event::service_restarted(remote_port));
                 local_port
             };
 
@@ -185,7 +184,9 @@ async fn process_snapshot(
                         {
                             fwd.protocol = detected;
                         }
-                        tui.emit(Event::protocol_detected(local_port, detected.as_str()));
+                        if detected != Protocol::Unknown {
+                            tui.push_event(Event::protocol_detected(local_port, detected.as_str()));
+                        }
                     });
                 }
             }
@@ -260,12 +261,7 @@ async fn process_snapshot(
                     process_name: process_name.clone(),
                 });
                 tui.status = format!("watching ({} forwarded)", tui.forwarded.len());
-                if local_port == remote_port {
-                    tui.push_event(format!("+ forwarded :{}", remote_port));
-                } else {
-                    tui.push_event(format!("+ forwarded :{} → :{}", remote_port, local_port));
-                }
-                tui.emit(Event::forward_added(
+                tui.push_event(Event::forward_added(
                     remote_port,
                     local_port,
                     remote_host,
@@ -302,15 +298,16 @@ async fn process_snapshot(
                         {
                             fwd.protocol = detected;
                         }
-                        // Emit updated event with detected protocol
-                        tui.emit(Event::protocol_detected(local_port, detected.as_str()));
+                        // Push event for detected protocol
+                        if detected != Protocol::Unknown {
+                            tui.push_event(Event::protocol_detected(local_port, detected.as_str()));
+                        }
                     });
                 }
             }
             Err(e) => {
                 let mut tui = tui_state.write().await;
-                tui.push_event(format!("✗ forward :{} failed: {}", remote_port, e));
-                tui.emit(Event::error(format!(
+                tui.push_event(Event::error(format!(
                     "forward :{} failed: {}",
                     remote_port, e
                 )));
@@ -344,8 +341,7 @@ async fn process_snapshot(
                 tui.status = format!("watching ({}/{} active)", active, total);
             }
 
-            tui.push_event(format!("- removed :{}", remote_port));
-            tui.emit(Event::forward_removed(remote_port));
+            tui.push_event(Event::forward_removed(remote_port));
         }
     }
 
@@ -383,8 +379,7 @@ async fn handle_toggle(
                 if let Some(fwd) = tui.forwarded.iter_mut().find(|f| f.remote_port == port) {
                     fwd.enabled = false;
                 }
-                tui.push_event(format!("○ disabled :{}", port));
-                tui.emit(Event::forward_disabled(port));
+                tui.push_event(Event::forward_disabled(port));
 
                 let active = tui.forwarded.iter().filter(|f| f.enabled).count();
                 let total = tui.forwarded.len();
@@ -392,8 +387,7 @@ async fn handle_toggle(
             }
             Err(e) => {
                 let mut tui = tui_state.write().await;
-                tui.push_event(format!("✗ failed to disable :{}: {}", port, e));
-                tui.emit(Event::error(format!("failed to disable :{}: {}", port, e)));
+                tui.push_event(Event::error(format!("failed to disable :{}: {}", port, e)));
             }
         }
     } else {
@@ -412,8 +406,7 @@ async fn handle_toggle(
                 if let Some(fwd) = tui.forwarded.iter_mut().find(|f| f.remote_port == port) {
                     fwd.enabled = true;
                 }
-                tui.push_event(format!("● enabled :{}", port));
-                tui.emit(Event::forward_enabled(port, local_port));
+                tui.push_event(Event::forward_enabled(port, local_port));
 
                 let active = tui.forwarded.iter().filter(|f| f.enabled).count();
                 let total = tui.forwarded.len();
@@ -421,8 +414,7 @@ async fn handle_toggle(
             }
             Err(e) => {
                 let mut tui = tui_state.write().await;
-                tui.push_event(format!("✗ failed to enable :{}: {}", port, e));
-                tui.emit(Event::error(format!("failed to enable :{}: {}", port, e)));
+                tui.push_event(Event::error(format!("failed to enable :{}: {}", port, e)));
             }
         }
     }
@@ -504,8 +496,7 @@ async fn reestablish_forwards(ctx: &SshContext, state: &mut MonitorState, tui_st
             }
             Err(e) => {
                 let mut tui = tui_state.write().await;
-                tui.push_event(format!("✗ restore :{} failed: {}", remote_port, e));
-                tui.emit(Event::error(format!(
+                tui.push_event(Event::error(format!(
                     "restore :{} failed: {}",
                     remote_port, e
                 )));
@@ -543,8 +534,7 @@ pub async fn run_monitor(
             let mut tui = tui_state.write().await;
             tui.status = "connecting (shell mode)...".to_string();
             tui.monitor_mode = MonitorModeDisplay::Shell;
-            tui.push_event("! shell mode forced via AUTOFWD_FORCE_SHELL".to_string());
-            tui.emit(Event::agent_fallback("forced via AUTOFWD_FORCE_SHELL"));
+            tui.push_event(Event::agent_fallback("forced via AUTOFWD_FORCE_SHELL"));
             MonitorMode::Shell
         } else {
             tui_state.write().await.status = "deploying agent...".to_string();
@@ -571,16 +561,14 @@ pub async fn run_monitor(
                     let mut tui = tui_state.write().await;
                     tui.status = "connecting...".to_string();
                     tui.monitor_mode = MonitorModeDisplay::Agent;
-                    tui.push_event(format!("✓ agent deployed ({})", arch));
-                    tui.emit(Event::agent_deployed(&arch, duration_ms));
+                    tui.push_event(Event::agent_deployed(&arch, duration_ms));
                     MonitorMode::Agent { path }
                 }
                 Ok(DeployResult::Unsupported { arch }) => {
                     let mut tui = tui_state.write().await;
                     tui.status = "connecting (shell fallback)...".to_string();
                     tui.monitor_mode = MonitorModeDisplay::Shell;
-                    tui.push_event(format!("! unsupported arch {}, using shell fallback", arch));
-                    tui.emit(Event::agent_fallback(&format!(
+                    tui.push_event(Event::agent_fallback(&format!(
                         "unsupported arch: {}",
                         arch
                     )));
@@ -590,19 +578,14 @@ pub async fn run_monitor(
                     let mut tui = tui_state.write().await;
                     tui.status = "connecting (shell fallback)...".to_string();
                     tui.monitor_mode = MonitorModeDisplay::Shell;
-                    tui.push_event("! agent not available, using shell fallback".to_string());
-                    tui.emit(Event::agent_fallback("agent binaries not embedded"));
+                    tui.push_event(Event::agent_fallback("agent binaries not embedded"));
                     MonitorMode::Shell
                 }
                 Err(e) => {
                     let mut tui = tui_state.write().await;
                     tui.status = "connecting (shell fallback)...".to_string();
                     tui.monitor_mode = MonitorModeDisplay::Shell;
-                    tui.push_event(format!(
-                        "! agent deploy failed: {:#}, using shell fallback",
-                        e
-                    ));
-                    tui.emit(Event::agent_fallback(&format!("deploy failed: {:#}", e)));
+                    tui.push_event(Event::agent_fallback(&format!("deploy failed: {:#}", e)));
                     MonitorMode::Shell
                 }
             }
@@ -610,8 +593,11 @@ pub async fn run_monitor(
     };
     redraw_notify.notify_one(); // Show deployment result
 
-    // Emit ready event now that agent deployment is complete
-    tui_state.read().await.emit(Event::ready(&ctx.target));
+    // Push ready event now that agent deployment is complete
+    tui_state
+        .write()
+        .await
+        .push_event(Event::ready(&ctx.target));
 
     let mut state = MonitorState::new(mode.clone());
     let mut reconnect_delay = Duration::from_secs(1);
@@ -634,16 +620,14 @@ pub async fn run_monitor(
                     {
                         let mut tui = tui_state.write().await;
                         tui.status = "reconnecting...".to_string();
-                        tui.push_event("! connection lost, reconnecting...".to_string());
-                        tui.emit(Event::connection_lost());
+                        tui.push_event(Event::connection_lost());
                     }
 
                     // Try to restart the ControlMaster
                     if let Err(e) = ssh_master_start(&ctx).await {
                         let mut tui = tui_state.write().await;
-                        tui.push_event(format!("✗ reconnect failed: {}", e));
-                        tui.emit(Event::error(format!("reconnect failed: {}", e)));
-                        tui.emit(Event::reconnecting(reconnect_delay.as_millis() as u64));
+                        tui.push_event(Event::error(format!("reconnect failed: {}", e)));
+                        tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
 
                         // Exponential backoff
                         tokio::time::sleep(reconnect_delay).await;
@@ -656,15 +640,14 @@ pub async fn run_monitor(
 
                     {
                         let mut tui = tui_state.write().await;
-                        tui.push_event("✓ reconnected".to_string());
-                        tui.emit(Event::reconnected());
+                        tui.push_event(Event::reconnected());
                     }
                     continue 'reconnect;
                 }
 
                 let mut tui = tui_state.write().await;
-                tui.push_event(format!("✗ monitor error: {}", e));
-                tui.emit(Event::error(format!("monitor error: {}", e)));
+                tui.push_event(Event::error(format!("monitor error: {}", e)));
+                drop(tui);
                 tokio::time::sleep(reconnect_delay).await;
                 reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
                 continue 'reconnect;
@@ -721,9 +704,8 @@ pub async fn run_monitor(
                             // EOF - connection likely died
                             let mut tui = tui_state.write().await;
                             tui.status = "connection lost...".to_string();
-                            tui.push_event("! monitor session ended".to_string());
-                            tui.emit(Event::connection_lost());
-                            tui.emit(Event::reconnecting(reconnect_delay.as_millis() as u64));
+                            tui.push_event(Event::connection_lost());
+                            tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
                             drop(tui);
                             let _ = child.kill().await;
                             let _ = child.wait().await;
@@ -733,9 +715,8 @@ pub async fn run_monitor(
                         }
                         Err(e) => {
                             let mut tui = tui_state.write().await;
-                            tui.push_event(format!("! read error: {}", e));
-                            tui.emit(Event::error(format!("read error: {}", e)));
-                            tui.emit(Event::reconnecting(reconnect_delay.as_millis() as u64));
+                            tui.push_event(Event::error(format!("read error: {}", e)));
+                            tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
                             drop(tui);
                             let _ = child.kill().await;
                             let _ = child.wait().await;
