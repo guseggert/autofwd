@@ -63,15 +63,11 @@ async fn detect_inner(port: u16) -> Protocol {
     let addr = format!("127.0.0.1:{}", port);
 
     // Try to connect with longer timeout for SSH tunnels
-    let stream = match tokio::time::timeout(
-        Duration::from_millis(500),
-        TcpStream::connect(&addr),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        _ => return Protocol::Unknown,
-    };
+    let stream =
+        match tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(&addr)).await {
+            Ok(Ok(stream)) => stream,
+            _ => return Protocol::Unknown,
+        };
 
     // Try passive detection first (protocols that send data immediately)
     if let Some(protocol) = try_passive_detection(stream).await {
@@ -79,32 +75,29 @@ async fn detect_inner(port: u16) -> Protocol {
     }
 
     // Try active probes (need new connections for each to avoid protocol confusion)
-    
+
     // Try Redis
-    if let Ok(Ok(stream)) = tokio::time::timeout(
-        Duration::from_millis(500),
-        TcpStream::connect(&addr),
-    ).await {
+    if let Ok(Ok(stream)) =
+        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(&addr)).await
+    {
         if try_redis(stream).await {
             return Protocol::Redis;
         }
     }
 
     // Try PostgreSQL (sends SSL request, expects 'N' or 'S' response)
-    if let Ok(Ok(stream)) = tokio::time::timeout(
-        Duration::from_millis(500),
-        TcpStream::connect(&addr),
-    ).await {
+    if let Ok(Ok(stream)) =
+        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(&addr)).await
+    {
         if try_postgresql(stream).await {
             return Protocol::PostgreSql;
         }
     }
 
     // Try HTTP (this is the most common case for dev servers)
-    if let Ok(Ok(stream)) = tokio::time::timeout(
-        Duration::from_millis(500),
-        TcpStream::connect(&addr),
-    ).await {
+    if let Ok(Ok(stream)) =
+        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(&addr)).await
+    {
         if let Some(protocol) = try_http(stream).await {
             return protocol;
         }
@@ -119,12 +112,7 @@ async fn try_passive_detection(mut stream: TcpStream) -> Option<Protocol> {
     let mut buf = [0u8; 256];
 
     // Wait up to 500ms for server to send initial data (through SSH tunnel)
-    let n = match tokio::time::timeout(
-        Duration::from_millis(500),
-        stream.read(&mut buf),
-    )
-    .await
-    {
+    let n = match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => n,
         _ => return None,
     };
@@ -172,12 +160,7 @@ async fn try_redis(mut stream: TcpStream) -> bool {
     }
 
     let mut buf = [0u8; 32];
-    let n = match tokio::time::timeout(
-        Duration::from_millis(500),
-        stream.read(&mut buf),
-    )
-    .await
-    {
+    let n = match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => n,
         _ => return false,
     };
@@ -193,18 +176,13 @@ async fn try_postgresql(mut stream: TcpStream) -> bool {
     // 4 bytes: length (8)
     // 4 bytes: SSL request code (80877103 = 0x04d2162f)
     let ssl_request: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
-    
+
     if stream.write_all(&ssl_request).await.is_err() {
         return false;
     }
 
     let mut buf = [0u8; 1];
-    let n = match tokio::time::timeout(
-        Duration::from_millis(500),
-        stream.read(&mut buf),
-    )
-    .await
-    {
+    let n = match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => n,
         _ => return false,
     };
@@ -222,12 +200,7 @@ async fn try_http(mut stream: TcpStream) -> Option<Protocol> {
     }
 
     let mut buf = [0u8; 1024];
-    let n = match tokio::time::timeout(
-        Duration::from_millis(500),
-        stream.read(&mut buf),
-    )
-    .await
-    {
+    let n = match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => n,
         _ => return None,
     };
@@ -272,12 +245,27 @@ mod tests {
     #[test]
     fn test_protocol_format_address() {
         assert_eq!(Protocol::Http.format_address(3000), "http://localhost:3000");
-        assert_eq!(Protocol::Http2.format_address(3000), "http://localhost:3000");
-        assert_eq!(Protocol::Http3.format_address(3000), "http://localhost:3000");
+        assert_eq!(
+            Protocol::Http2.format_address(3000),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            Protocol::Http3.format_address(3000),
+            "http://localhost:3000"
+        );
         assert_eq!(Protocol::Https.format_address(443), "https://localhost:443");
-        assert_eq!(Protocol::Redis.format_address(6379), "redis://localhost:6379");
-        assert_eq!(Protocol::PostgreSql.format_address(5432), "postgres://localhost:5432");
-        assert_eq!(Protocol::MySql.format_address(3306), "mysql://localhost:3306");
+        assert_eq!(
+            Protocol::Redis.format_address(6379),
+            "redis://localhost:6379"
+        );
+        assert_eq!(
+            Protocol::PostgreSql.format_address(5432),
+            "postgres://localhost:5432"
+        );
+        assert_eq!(
+            Protocol::MySql.format_address(3306),
+            "mysql://localhost:3306"
+        );
         assert_eq!(Protocol::Ssh.format_address(22), "ssh://localhost:22");
         assert_eq!(Protocol::Unknown.format_address(8080), "localhost:8080");
     }

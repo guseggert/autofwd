@@ -547,56 +547,65 @@ pub async fn run_monitor(
             tui.emit(Event::agent_fallback("forced via AUTOFWD_FORCE_SHELL"));
             MonitorMode::Shell
         } else {
-        tui_state.write().await.status = "deploying agent...".to_string();
-        redraw_notify.notify_one(); // Show "deploying agent..." immediately
+            tui_state.write().await.status = "deploying agent...".to_string();
+            redraw_notify.notify_one(); // Show "deploying agent..." immediately
 
-        // Emit timing for agent deployment
-        let deploy_start = Instant::now();
-        let result = ensure_agent_deployed(&ctx).await;
-        let deploy_duration = deploy_start.elapsed().as_millis() as u64;
-        tui_state.read().await.emit(Event::timing("ensure_agent_deployed", deploy_duration));
+            // Emit timing for agent deployment
+            let deploy_start = Instant::now();
+            let result = ensure_agent_deployed(&ctx).await;
+            let deploy_duration = deploy_start.elapsed().as_millis() as u64;
+            tui_state
+                .read()
+                .await
+                .emit(Event::timing("ensure_agent_deployed", deploy_duration));
 
-        match result {
-            Ok(DeployResult::Ready { path }) => {
-                let mut tui = tui_state.write().await;
-                tui.status = "connecting...".to_string();
-                tui.monitor_mode = MonitorModeDisplay::Agent;
-                MonitorMode::Agent { path }
+            match result {
+                Ok(DeployResult::Ready { path }) => {
+                    let mut tui = tui_state.write().await;
+                    tui.status = "connecting...".to_string();
+                    tui.monitor_mode = MonitorModeDisplay::Agent;
+                    MonitorMode::Agent { path }
+                }
+                Ok(DeployResult::Deployed { path, arch }) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let mut tui = tui_state.write().await;
+                    tui.status = "connecting...".to_string();
+                    tui.monitor_mode = MonitorModeDisplay::Agent;
+                    tui.push_event(format!("✓ agent deployed ({})", arch));
+                    tui.emit(Event::agent_deployed(&arch, duration_ms));
+                    MonitorMode::Agent { path }
+                }
+                Ok(DeployResult::Unsupported { arch }) => {
+                    let mut tui = tui_state.write().await;
+                    tui.status = "connecting (shell fallback)...".to_string();
+                    tui.monitor_mode = MonitorModeDisplay::Shell;
+                    tui.push_event(format!("! unsupported arch {}, using shell fallback", arch));
+                    tui.emit(Event::agent_fallback(&format!(
+                        "unsupported arch: {}",
+                        arch
+                    )));
+                    MonitorMode::Shell
+                }
+                Ok(DeployResult::NotAvailable) => {
+                    let mut tui = tui_state.write().await;
+                    tui.status = "connecting (shell fallback)...".to_string();
+                    tui.monitor_mode = MonitorModeDisplay::Shell;
+                    tui.push_event("! agent not available, using shell fallback".to_string());
+                    tui.emit(Event::agent_fallback("agent binaries not embedded"));
+                    MonitorMode::Shell
+                }
+                Err(e) => {
+                    let mut tui = tui_state.write().await;
+                    tui.status = "connecting (shell fallback)...".to_string();
+                    tui.monitor_mode = MonitorModeDisplay::Shell;
+                    tui.push_event(format!(
+                        "! agent deploy failed: {:#}, using shell fallback",
+                        e
+                    ));
+                    tui.emit(Event::agent_fallback(&format!("deploy failed: {:#}", e)));
+                    MonitorMode::Shell
+                }
             }
-            Ok(DeployResult::Deployed { path, arch }) => {
-                let duration_ms = start.elapsed().as_millis() as u64;
-                let mut tui = tui_state.write().await;
-                tui.status = "connecting...".to_string();
-                tui.monitor_mode = MonitorModeDisplay::Agent;
-                tui.push_event(format!("✓ agent deployed ({})", arch));
-                tui.emit(Event::agent_deployed(&arch, duration_ms));
-                MonitorMode::Agent { path }
-            }
-            Ok(DeployResult::Unsupported { arch }) => {
-                let mut tui = tui_state.write().await;
-                tui.status = "connecting (shell fallback)...".to_string();
-                tui.monitor_mode = MonitorModeDisplay::Shell;
-                tui.push_event(format!("! unsupported arch {}, using shell fallback", arch));
-                tui.emit(Event::agent_fallback(&format!("unsupported arch: {}", arch)));
-                MonitorMode::Shell
-            }
-            Ok(DeployResult::NotAvailable) => {
-                let mut tui = tui_state.write().await;
-                tui.status = "connecting (shell fallback)...".to_string();
-                tui.monitor_mode = MonitorModeDisplay::Shell;
-                tui.push_event("! agent not available, using shell fallback".to_string());
-                tui.emit(Event::agent_fallback("agent binaries not embedded"));
-                MonitorMode::Shell
-            }
-            Err(e) => {
-                let mut tui = tui_state.write().await;
-                tui.status = "connecting (shell fallback)...".to_string();
-                tui.monitor_mode = MonitorModeDisplay::Shell;
-                tui.push_event(format!("! agent deploy failed: {:#}, using shell fallback", e));
-                tui.emit(Event::agent_fallback(&format!("deploy failed: {:#}", e)));
-                MonitorMode::Shell
-            }
-        }
         }
     };
     redraw_notify.notify_one(); // Show deployment result
@@ -664,7 +673,10 @@ pub async fn run_monitor(
 
         // Emit timing for monitor session spawn
         let spawn_duration = spawn_start.elapsed().as_millis() as u64;
-        tui_state.read().await.emit(Event::timing("spawn_monitor_session", spawn_duration));
+        tui_state
+            .read()
+            .await
+            .emit(Event::timing("spawn_monitor_session", spawn_duration));
 
         // Reset monitor state for new session (keep forwards info)
         state.snapshot_lines.clear();

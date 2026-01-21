@@ -187,14 +187,12 @@ impl Tui {
 
             // Header with monitor mode indicator
             let mode_indicator = match state.monitor_mode {
-                MonitorModeDisplay::Agent => Span::styled(
-                    " [agent] ",
-                    Style::default().fg(Color::Green),
-                ),
-                MonitorModeDisplay::Shell => Span::styled(
-                    " [shell] ",
-                    Style::default().fg(Color::Yellow),
-                ),
+                MonitorModeDisplay::Agent => {
+                    Span::styled(" [agent] ", Style::default().fg(Color::Green))
+                }
+                MonitorModeDisplay::Shell => {
+                    Span::styled(" [shell] ", Style::default().fg(Color::Yellow))
+                }
                 MonitorModeDisplay::Unknown => Span::raw(""),
             };
             let header_line = Line::from(vec![
@@ -223,10 +221,7 @@ impl Tui {
                     let age = fwd.forwarded_at.elapsed();
                     let age_str = format_duration(age);
                     let status_icon = if fwd.enabled { "●" } else { "○" };
-                    let process = fwd
-                        .process_name
-                        .as_deref()
-                        .unwrap_or("-");
+                    let process = fwd.process_name.as_deref().unwrap_or("-");
                     let style = if fwd.enabled {
                         Style::default()
                     } else {

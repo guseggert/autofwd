@@ -200,7 +200,13 @@ async fn main() -> Result<()> {
         });
 
         // Run TUI (blocks until quit confirmed)
-        run_tui(tui_state.clone(), args.target.clone(), cmd_tx, redraw_notify).await?;
+        run_tui(
+            tui_state.clone(),
+            args.target.clone(),
+            cmd_tx,
+            redraw_notify,
+        )
+        .await?;
 
         // Signal monitor to stop
         tui_state.write().await.should_quit = true;
