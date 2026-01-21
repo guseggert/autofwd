@@ -1,18 +1,8 @@
 # autofwd
 
-Automatic port forwarding for SSH sessions. Detects listening ports on a remote server and forwards them to your local machine — like VS Code/Cursor, but for the terminal.
+Automatic SSH port forwarding. Detects listening ports on a remote server and auto-forwards them to your local machine. Inspired by VS Code's port forwarding.
 
 ![autofwd demo](docs/demo.gif)
-
-## Features
-
-- **Automatic detection** — monitors listening ports on the remote host and forwards them as they appear
-- **Process names** — shows which process owns each port (e.g., `node`, `python`, `nginx`)
-- **TUI interface** — view and manage forwarded ports in real-time
-- **Toggle forwards** — enable/disable individual port forwards without disconnecting
-- **Smart port mapping** — automatically finds free local ports when there's a collision
-- **SSH ControlMaster** — uses a single SSH connection for all operations
-- **Zero dependencies on remote** — works on any Linux server, no installation required
 
 ## Installation
 
@@ -77,66 +67,18 @@ With custom SSH options:
 autofwd myserver -- -i ~/.ssh/mykey -p 2222
 ```
 
-## Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `↑`/`k`/`Ctrl+P` | Move selection up |
-| `↓`/`j`/`Ctrl+N` | Move selection down |
-| `Space` | Toggle port forwarding |
-| `e` | Toggle events log |
-| `?` | Show help |
-| `q`/`Esc` | Quit (with confirmation) |
-
 ## Requirements
 
 - **Remote**: Linux (x86_64, aarch64, or armv7)
 - **Local**: SSH client with ControlMaster support
-- **Network**: SSH access to the remote host
 
 ## How it works
 
 autofwd uses a lightweight agent binary that runs on the remote server to monitor listening ports.
 
-### Architecture
+The client includes support for any remote architecture. It detects the architecture and installs the right agent binary at runtime.
 
-```
-┌─────────────────┐         SSH          ┌─────────────────┐
-│   Local (TUI)   │◄────────────────────►│  Remote Server  │
-│                 │                       │                 │
-│  - Display UI   │   ControlMaster      │  - Agent binary │
-│  - Manage fwds  │◄────────────────────►│  - Port monitor │
-│                 │   Port forwards      │  - Process info │
-└─────────────────┘                       └─────────────────┘
-```
-
-### Startup sequence
-
-1. **Connect** — Establishes an SSH ControlMaster connection
-2. **Deploy agent** — Uploads a small (~250KB) static binary to `/tmp/autofwd-agent-<hash>`
-3. **Monitor** — Agent parses `/proc/net/tcp` to detect listening ports and their owning processes
-4. **Forward** — Uses SSH's `-O forward` to dynamically add/remove port forwards
-5. **Display** — Shows everything in a terminal UI with real-time updates
-
-### Agent vs Shell fallback
-
-The TUI header shows the current monitoring mode:
-
-- **`[agent]`** (green) — Using the deployed agent binary. Full functionality including process names.
-- **`[shell]`** (yellow) — Fallback mode using a shell script. Port forwarding works, but process names are unavailable.
-
-The shell fallback is used when:
-- The remote architecture isn't supported (only x86_64, aarch64, armv7 Linux are bundled)
-- Agent deployment fails for any reason
-- Running a development build without compiled agents
-
-### Supported platforms
-
-| Remote OS | Architectures |
-|-----------|---------------|
-| Linux | x86_64, aarch64 (arm64), armv7 |
-
-The local machine can be any platform that supports Rust (macOS, Linux, Windows).
+If the remote client can't be used for some reason, autofwd falls back to running a remote shell script.
 
 ## License
 
