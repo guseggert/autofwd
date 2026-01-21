@@ -18,7 +18,7 @@ Automatic port forwarding for SSH sessions. Detects listening ports on a remote 
 
 ### From releases
 
-Download the latest binary for your platform from [Releases](https://github.com/anomalyco/autofwd/releases).
+Download the latest binary for your platform from [Releases](https://github.com/guseggert/autofwd/releases).
 
 ### From source
 
@@ -114,7 +114,7 @@ autofwd uses a lightweight agent binary that runs on the remote server to monito
 
 1. **Connect** — Establishes an SSH ControlMaster connection
 2. **Deploy agent** — Uploads a small (~250KB) static binary to `/tmp/autofwd-agent-<hash>`
-3. **Monitor** — Agent runs `netstat` to detect listening ports and their owning processes
+3. **Monitor** — Agent parses `/proc/net/tcp` to detect listening ports and their owning processes
 4. **Forward** — Uses SSH's `-O forward` to dynamically add/remove port forwards
 5. **Display** — Shows everything in a terminal UI with real-time updates
 
