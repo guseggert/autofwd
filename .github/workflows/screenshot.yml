@@ -15,10 +15,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Install VHS and dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg ttyd
+          go install github.com/charmbracelet/vhs@latest
 
       # Download pre-built autofwd binary
       - name: Download autofwd binary
@@ -42,8 +48,7 @@ jobs:
         run: docker build -t autofwd-test-ssh crates/autofwd/tests/docker
 
       - name: Generate SSH key
-        run: |
-          ssh-keygen -t ed25519 -f /tmp/demo_key -N ""
+        run: ssh-keygen -t ed25519 -f /tmp/demo_key -N ""
 
       - name: Start demo container with mock services
         run: |
@@ -63,9 +68,12 @@ jobs:
           sleep 2
 
       - name: Run VHS
-        uses: charmbracelet/vhs-action@v2
-        with:
-          path: docs/demo.tape
+        run: vhs docs/demo.tape
+
+      - name: Verify GIF
+        run: |
+          ls -lh docs/demo.gif
+          file docs/demo.gif
 
       - name: Cleanup
         if: always()
