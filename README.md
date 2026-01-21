@@ -74,7 +74,7 @@ autofwd myserver -- -i ~/.ssh/mykey -p 2222
 
 ## How it works
 
-autofwd uses a lightweight agent binary that runs on the remote server to monitor listening ports.
+autofwd uses a lightweight agent binary that runs on the remote server to monitor listening ports, discover process names when possible, and probe services for protocol detection (HTTP, PostgreSQL, Redis, etc.).
 
 The client includes support for any remote architecture. It detects the architecture and installs the right agent binary at runtime.
 
