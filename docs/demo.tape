@@ -3,8 +3,8 @@ Output docs/demo.gif
 
 Set Shell "bash"
 Set FontSize 14
-Set Width 100
-Set Height 30
+Set Width 120
+Set Height 120
 Set Theme "Dracula"
 
 Type "autofwd testuser@localhost -- -p 2222 -i /tmp/demo_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
