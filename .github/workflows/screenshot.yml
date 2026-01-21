@@ -77,7 +77,10 @@ jobs:
           docker exec -d demo sh -c 'cp /usr/bin/nc /tmp/postgres; while true; do /tmp/postgres -l -p 5432 -q 1 2>/dev/null; done'
           docker exec -d demo sh -c 'cp /usr/bin/nc /tmp/redis-server; while true; do echo "+PONG" | /tmp/redis-server -l -p 6379 -q 1 2>/dev/null; done'
 
-          sleep 2
+          sleep 3
+          
+          # Verify services are listening
+          docker exec demo netstat -tlnp || true
 
       - name: Run VHS
         run: vhs docs/demo.tape
