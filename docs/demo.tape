@@ -8,7 +8,7 @@ Set Height 500
 Set Theme "Dracula"
 Set TypingSpeed 50ms
 
-Type "autofwd demo --allow 3000,5432,6379"
+Type "autofwd demo-host"
 Sleep 1s
 Enter
 

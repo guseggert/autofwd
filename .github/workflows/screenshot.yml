@@ -52,7 +52,7 @@ jobs:
           ssh-keygen -t ed25519 -f /tmp/demo_key -N ""
           mkdir -p ~/.ssh
           cat > ~/.ssh/config << 'EOF'
-          Host demo
+          Host demo-host
             HostName localhost
             Port 2222
             User testuser
