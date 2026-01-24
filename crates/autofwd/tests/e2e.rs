@@ -22,20 +22,21 @@ struct AutofwdProcess {
 
 impl AutofwdProcess {
     fn start(container: &TestContainer) -> Result<Self> {
-        Self::start_with_options(container, &[], &[])
+        Self::start_with_options(container, "500ms", &[], &[])
     }
 
     fn start_with_args(container: &TestContainer, extra_args: &[&str]) -> Result<Self> {
-        Self::start_with_options(container, extra_args, &[])
+        Self::start_with_options(container, "500ms", extra_args, &[])
     }
 
     fn start_with_options(
         container: &TestContainer,
+        interval: &str,
         extra_args: &[&str],
         env_vars: &[(&str, &str)],
     ) -> Result<Self> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_autofwd"));
-        cmd.arg("--headless").arg("--interval").arg("500ms");
+        cmd.arg("--headless").arg("--interval").arg(interval);
 
         for arg in extra_args {
             cmd.arg(arg);
@@ -102,6 +103,39 @@ impl AutofwdProcess {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     anyhow::bail!("EOF without finding event: {}", event_type);
+                }
+            }
+        }
+    }
+
+    /// Read JSON events from stdout until the predicate matches or timeout.
+    fn wait_for_event_matching<F>(&mut self, timeout: Duration, mut f: F) -> Result<Value>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timeout waiting for matching event");
+            }
+
+            match self.line_rx.recv_timeout(remaining) {
+                Ok(line) => {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let event: Value = serde_json::from_str(&line)?;
+                    if f(&event) {
+                        return Ok(event);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    anyhow::bail!("timeout waiting for matching event");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("EOF without finding matching event");
                 }
             }
         }
@@ -650,8 +684,12 @@ fn test_shell_fallback_mode() -> Result<()> {
     let container = TestContainer::start()?;
 
     // Start autofwd with forced shell mode
-    let mut autofwd =
-        AutofwdProcess::start_with_options(&container, &[], &[("AUTOFWD_FORCE_SHELL", "1")])?;
+    let mut autofwd = AutofwdProcess::start_with_options(
+        &container,
+        "500ms",
+        &[],
+        &[("AUTOFWD_FORCE_SHELL", "1")],
+    )?;
 
     // Collect events while waiting for ready
     let (_ready, events) = autofwd.wait_for_event_collecting("ready", Duration::from_secs(15))?;
@@ -711,6 +749,144 @@ fn test_shell_fallback_mode() -> Result<()> {
 }
 
 #[test]
+fn test_agent_backoff_emits_diagnostics() -> Result<()> {
+    // Verifies agent-side exponential backoff is observable via optional JSON diagnostics.
+    if !agents_available() {
+        println!("Skipping test_agent_backoff_emits_diagnostics - agents not available");
+        return Ok(());
+    }
+
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    // Use a small min interval so backoff steps happen quickly, and cap max interval for determinism.
+    let mut autofwd = AutofwdProcess::start_with_options(
+        &container,
+        "50ms",
+        &[],
+        &[
+            ("AUTOFWD_DEBUG_EVENTS", "1"),
+            ("AUTOFWD_AGENT_DEBUG", "1"),
+            ("AUTOFWD_AGENT_MAX_INTERVAL_MS", "200"),
+            // Make this test deterministic across environments.
+            ("AUTOFWD_AGENT_DISABLE_NETLINK", "1"),
+        ],
+    )?;
+
+    // Collect startup events so we can assert we're actually using the agent (not shell fallback).
+    let (_ready, startup_events) =
+        autofwd.wait_for_event_collecting("ready", Duration::from_secs(15))?;
+    let got_fallback = startup_events
+        .iter()
+        .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("agent_fallback"));
+    assert!(
+        !got_fallback,
+        "Expected agent mode (no fallback). Startup events: {:?}",
+        startup_events
+    );
+
+    // Wait for *any* diagnostics first to confirm the channel is working and max interval is applied.
+    let first_diag = autofwd.wait_for_event_matching(Duration::from_secs(10), |e| {
+        e.get("event").and_then(|v| v.as_str()) == Some("agent_diagnostics")
+    })?;
+    println!("Saw first agent diagnostics: {:?}", first_diag);
+    assert_eq!(
+        first_diag.get("backend").and_then(|v| v.as_str()),
+        Some("proc"),
+        "Expected proc backend (netlink disabled). Event: {:?}",
+        first_diag
+    );
+    assert_eq!(
+        first_diag.get("min_ms").and_then(|v| v.as_u64()),
+        Some(50),
+        "Expected min_ms=50. Event: {:?}",
+        first_diag
+    );
+    assert_eq!(
+        first_diag.get("max_ms").and_then(|v| v.as_u64()),
+        Some(200),
+        "Expected max_ms=200 (flag must reach agent). Event: {:?}",
+        first_diag
+    );
+
+    // Now wait until the agent reports it has backed off to the configured max interval.
+    let ev = autofwd.wait_for_event_matching(Duration::from_secs(10), |e| {
+        e.get("event").and_then(|v| v.as_str()) == Some("agent_diagnostics")
+            && e.get("phase").and_then(|v| v.as_str()) == Some("backoff")
+            && e.get("sleep_ms").and_then(|v| v.as_u64()) == Some(200)
+    })?;
+    println!("Saw agent diagnostics at max backoff: {:?}", ev);
+
+    // Trigger activity; backoff should reset.
+    container.start_listener(7778)?;
+
+    // Ensure forwarding still works.
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(10))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(7778)
+    );
+
+    // We should eventually see a reset diagnostic (sleep back to min interval).
+    let ev = autofwd.wait_for_event_matching(Duration::from_secs(10), |e| {
+        e.get("event").and_then(|v| v.as_str()) == Some("agent_diagnostics")
+            && e.get("phase").and_then(|v| v.as_str()) == Some("reset")
+            && e.get("sleep_ms").and_then(|v| v.as_u64()) == Some(50)
+    })?;
+    println!("Saw agent reset diagnostics: {:?}", ev);
+
+    Ok(())
+}
+
+#[test]
+fn test_agent_netlink_backend_used() -> Result<()> {
+    // Verifies that netlink sock_diag is used by default when available.
+    if !agents_available() {
+        println!("Skipping test_agent_netlink_backend_used - agents not available");
+        return Ok(());
+    }
+
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    let mut autofwd = AutofwdProcess::start_with_options(
+        &container,
+        "50ms",
+        &[],
+        &[
+            ("AUTOFWD_DEBUG_EVENTS", "1"),
+            ("AUTOFWD_AGENT_DEBUG", "1"),
+            ("AUTOFWD_AGENT_MAX_INTERVAL_MS", "200"),
+        ],
+    )?;
+
+    let (_ready, startup_events) =
+        autofwd.wait_for_event_collecting("ready", Duration::from_secs(15))?;
+    let got_fallback = startup_events
+        .iter()
+        .any(|e| e.get("event").and_then(|v| v.as_str()) == Some("agent_fallback"));
+    assert!(
+        !got_fallback,
+        "Expected agent mode (no fallback). Startup events: {:?}",
+        startup_events
+    );
+
+    let first_diag = autofwd.wait_for_event_matching(Duration::from_secs(10), |e| {
+        e.get("event").and_then(|v| v.as_str()) == Some("agent_diagnostics")
+    })?;
+    println!("Saw first agent diagnostics: {:?}", first_diag);
+
+    assert_eq!(
+        first_diag.get("backend").and_then(|v| v.as_str()),
+        Some("netlink"),
+        "Expected netlink backend by default. Event: {:?}",
+        first_diag
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_startup_timing() -> Result<()> {
     // This test captures timing events to debug startup performance
     ensure_image_built()?;
@@ -745,6 +921,57 @@ fn test_startup_timing() -> Result<()> {
         let event_type = event.get("event").and_then(|v| v.as_str()).unwrap_or("?");
         println!("  {}: {:?}", event_type, event);
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_reconnect_after_container_pause() -> Result<()> {
+    // Simulates laptop sleep/wake by pausing the SSH server container.
+    // We expect autofwd to detect staleness and recover without restart.
+    if !agents_available() {
+        println!("Skipping test_reconnect_after_container_pause - agents not available");
+        return Ok(());
+    }
+
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    let mut autofwd = AutofwdProcess::start_with_options(
+        &container,
+        "200ms",
+        &[],
+        &[
+            ("AUTOFWD_STALE_MS", "6000"),
+            // Ensure we can observe state changes
+            ("AUTOFWD_DEBUG_EVENTS", "1"),
+            ("AUTOFWD_AGENT_DEBUG", "1"),
+            ("AUTOFWD_AGENT_MAX_INTERVAL_MS", "500"),
+        ],
+    )?;
+
+    autofwd.wait_for_event("ready", Duration::from_secs(15))?;
+
+    // Pause long enough to exceed AUTOFWD_STALE_MS.
+    container.pause()?;
+    std::thread::sleep(Duration::from_secs(7));
+
+    // We should get a connection_lost event (triggered by stale watchdog).
+    autofwd.wait_for_event("connection_lost", Duration::from_secs(10))?;
+
+    // Bring it back and ensure we can forward a new port.
+    container.unpause()?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    // We should see a reconnected event once the monitor stream is alive again.
+    autofwd.wait_for_event("reconnected", Duration::from_secs(20))?;
+
+    container.start_listener(7781)?;
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(20))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(7781)
+    );
 
     Ok(())
 }

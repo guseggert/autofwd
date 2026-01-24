@@ -651,6 +651,32 @@ impl TestContainer {
         Ok(())
     }
 
+    /// Pause the container (simulates a "sleep" where no network traffic progresses).
+    pub fn pause(&self) -> Result<()> {
+        let output = Command::new("docker")
+            .args(["pause", &self.container_id])
+            .output()
+            .context("failed to pause container")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("docker pause failed: {}", stderr.trim());
+        }
+        Ok(())
+    }
+
+    /// Unpause the container.
+    pub fn unpause(&self) -> Result<()> {
+        let output = Command::new("docker")
+            .args(["unpause", &self.container_id])
+            .output()
+            .context("failed to unpause container")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("docker unpause failed: {}", stderr.trim());
+        }
+        Ok(())
+    }
+
     /// Stop the container.
     pub fn stop(&self) {
         let _ = Command::new("docker")
