@@ -85,7 +85,7 @@ cargo test --workspace -- --test-threads=1
 
 [tasks."test:unit"]
 description = "Run unit tests only"
-run = "cargo test --workspace --lib"
+run = "cargo test --workspace --bins"
 
 [tasks."test:e2e"]
 description = "Run E2E tests (requires Docker)"
