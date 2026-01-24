@@ -17,6 +17,32 @@ use crate::tui::{CommandReceiver, ForwardedPort, MonitorModeDisplay, SharedState
 
 const END_MARKER: &str = "__AUTOFWD_END__";
 const HEARTBEAT_MARKER: &str = "__AUTOFWD_HEARTBEAT__";
+const DEBUG_MARKER: &str = "__AUTOFWD_DEBUG__";
+
+fn stale_after() -> Duration {
+    // Detect "hung" sessions after sleep/wake by requiring periodic activity
+    // (heartbeat, snapshot, or any agent output).
+    //
+    // The agent heartbeat is ~5s, so choose a default comfortably above that.
+    let default_ms: u64 = 20_000;
+    match std::env::var("AUTOFWD_STALE_MS") {
+        Ok(s) => s
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_millis(default_ms)),
+        Err(_) => Duration::from_millis(default_ms),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AgentDebugEvent {
+    backend: Option<String>,
+    phase: Option<String>,
+    sleep_ms: Option<u64>,
+    min_ms: Option<u64>,
+    max_ms: Option<u64>,
+}
 
 /// Monitoring mode: agent binary or fallback shell script.
 #[derive(Debug, Clone)]
@@ -432,7 +458,26 @@ async fn spawn_monitor_session(
     let (command, use_stdin) = match mode {
         MonitorMode::Agent { path } => {
             // Run the agent binary directly
-            let cmd = format!("{} --interval {}", path, interval.as_millis());
+            let mut cmd = format!("{} --interval {}", path, interval.as_millis());
+
+            // Optional: cap idle backoff (useful for tests)
+            if let Ok(v) = std::env::var("AUTOFWD_AGENT_MAX_INTERVAL_MS") {
+                if let Ok(ms) = v.parse::<u64>() {
+                    cmd.push_str(&format!(" --max-interval {}", ms.max(1)));
+                }
+            }
+
+            // Optional: enable agent-side debug marker output
+            // (we keep this local-env driven so it's easy to enable in tests)
+            if std::env::var_os("AUTOFWD_AGENT_DEBUG").is_some() {
+                cmd = format!("AUTOFWD_AGENT_DEBUG=1 {}", cmd);
+            }
+
+            // Optional: force-disable netlink inside the agent (test / compatibility).
+            if std::env::var_os("AUTOFWD_AGENT_DISABLE_NETLINK").is_some() {
+                cmd = format!("AUTOFWD_AGENT_DISABLE_NETLINK=1 {}", cmd);
+            }
+
             (cmd, false)
         }
         MonitorMode::Shell => {
@@ -443,6 +488,8 @@ async fn spawn_monitor_session(
 
     let mut child = Command::new("ssh")
         .args(&ctx.ssh_args)
+        .arg("-o")
+        .arg("ConnectTimeout=5")
         .arg("-S")
         .arg(ctx.control_path.to_string_lossy().to_string())
         .arg("-T")
@@ -602,6 +649,8 @@ pub async fn run_monitor(
     let mut state = MonitorState::new(mode.clone());
     let mut reconnect_delay = Duration::from_secs(1);
     const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+    let stale_after = stale_after();
+    let mut pending_reconnected_event = false;
 
     // Outer loop handles reconnection
     'reconnect: loop {
@@ -621,6 +670,7 @@ pub async fn run_monitor(
                         let mut tui = tui_state.write().await;
                         tui.status = "reconnecting...".to_string();
                         tui.push_event(Event::connection_lost());
+                        pending_reconnected_event = true;
                     }
 
                     // Try to restart the ControlMaster
@@ -637,11 +687,6 @@ pub async fn run_monitor(
 
                     // Re-establish forwards
                     reestablish_forwards(&ctx, &mut state, &tui_state).await;
-
-                    {
-                        let mut tui = tui_state.write().await;
-                        tui.push_event(Event::reconnected());
-                    }
                     continue 'reconnect;
                 }
 
@@ -665,6 +710,10 @@ pub async fn run_monitor(
         state.snapshot_lines.clear();
         state.initialized = false;
 
+        // Liveness tracking: if we get no output for a while, force a reconnect.
+        let mut last_activity = Instant::now();
+        let mut reconnected_emitted_this_session = false;
+
         // Track time to first data
         let first_data_start = Instant::now();
         let mut first_data_received = false;
@@ -681,8 +730,14 @@ pub async fn run_monitor(
                 result = lines.next_line() => {
                     match result {
                         Ok(Some(line)) => {
+                            last_activity = Instant::now();
                             let trimmed = line.trim();
                             if trimmed == END_MARKER {
+                                if pending_reconnected_event && !reconnected_emitted_this_session {
+                                    tui_state.write().await.push_event(Event::reconnected());
+                                    pending_reconnected_event = false;
+                                    reconnected_emitted_this_session = true;
+                                }
                                 // Emit timing for first data
                                 if !first_data_received {
                                     first_data_received = true;
@@ -694,8 +749,36 @@ pub async fn run_monitor(
                                 // Reset backoff only after successful data - proves stable connection
                                 reconnect_delay = Duration::from_secs(1);
                             } else if trimmed == HEARTBEAT_MARKER {
+                                if pending_reconnected_event && !reconnected_emitted_this_session {
+                                    tui_state.write().await.push_event(Event::reconnected());
+                                    pending_reconnected_event = false;
+                                    reconnected_emitted_this_session = true;
+                                }
                                 // Connection is alive, reset backoff
                                 reconnect_delay = Duration::from_secs(1);
+                            } else if trimmed.starts_with(DEBUG_MARKER) {
+                                // Optional debug marker line from the agent; never part of a snapshot.
+                                // If AUTOFWD_DEBUG_EVENTS is set, translate to a headless JSON event.
+                                if std::env::var_os("AUTOFWD_DEBUG_EVENTS").is_some() {
+                                    if let Some(json) = trimmed.strip_prefix(DEBUG_MARKER).map(|s| s.trim()) {
+                                        if let Ok(ev) = serde_json::from_str::<AgentDebugEvent>(json) {
+                                            if let (Some(backend), Some(phase), Some(sleep_ms), Some(min_ms), Some(max_ms)) =
+                                                (ev.backend, ev.phase, ev.sleep_ms, ev.min_ms, ev.max_ms)
+                                            {
+                                                tui_state
+                                                    .read()
+                                                    .await
+                                                    .emit(Event::agent_diagnostics(
+                                                        &backend,
+                                                        &phase,
+                                                        sleep_ms,
+                                                        min_ms,
+                                                        max_ms,
+                                                    ));
+                                            }
+                                        }
+                                    }
+                                }
                             } else {
                                 state.snapshot_lines.push(line);
                             }
@@ -706,6 +789,7 @@ pub async fn run_monitor(
                             tui.status = "connection lost...".to_string();
                             tui.push_event(Event::connection_lost());
                             tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
+                            pending_reconnected_event = true;
                             drop(tui);
                             let _ = child.kill().await;
                             let _ = child.wait().await;
@@ -717,6 +801,7 @@ pub async fn run_monitor(
                             let mut tui = tui_state.write().await;
                             tui.push_event(Event::error(format!("read error: {}", e)));
                             tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
+                            pending_reconnected_event = true;
                             drop(tui);
                             let _ = child.kill().await;
                             let _ = child.wait().await;
@@ -734,7 +819,41 @@ pub async fn run_monitor(
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if last_activity.elapsed() >= stale_after {
+                        {
+                            let mut tui = tui_state.write().await;
+                            tui.status = "connection stale...".to_string();
+                            tui.push_event(Event::connection_lost());
+                            tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
+                            pending_reconnected_event = true;
+                        }
+
+                        // Tear down the current monitor session.
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+
+                        // After sleep/wake the ControlMaster often gets "wedged" (socket exists but no traffic).
+                        // Restarting it is the most reliable recovery strategy.
+                        let _ = std::fs::remove_file(&ctx.control_path);
+                        if let Err(e) = ssh_master_start(&ctx).await {
+                            let mut tui = tui_state.write().await;
+                            tui.push_event(Event::error(format!("reconnect failed: {}", e)));
+                            tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
+                            drop(tui);
+
+                            tokio::time::sleep(reconnect_delay).await;
+                            reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+                            continue 'reconnect;
+                        }
+
+                        reestablish_forwards(&ctx, &mut state, &tui_state).await;
+
+                        // Fast retry after a stale session.
+                        reconnect_delay = Duration::from_secs(1);
+                        continue 'reconnect;
+                    }
+                }
             }
         }
     }

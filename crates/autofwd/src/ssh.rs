@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
 
+const CONNECT_TIMEOUT_SECS: u32 = 5;
+
 /// Context for SSH operations, shared across the application.
 #[derive(Clone, Debug)]
 pub struct SshContext {
@@ -24,6 +26,10 @@ pub fn control_path_for(target: &str) -> PathBuf {
 
 /// Start the SSH ControlMaster in the background.
 pub async fn ssh_master_start(ctx: &SshContext) -> Result<()> {
+    // If a previous run crashed or the machine slept, the control socket file may be stale.
+    // Remove it proactively so we can always restart the master.
+    let _ = std::fs::remove_file(&ctx.control_path);
+
     let mut cmd = Command::new("ssh");
     cmd.args(&ctx.ssh_args)
         .arg("-M") // ControlMaster mode
@@ -31,6 +37,8 @@ pub async fn ssh_master_start(ctx: &SshContext) -> Result<()> {
         .arg("-f") // Background after auth
         .arg("-o")
         .arg("ControlPersist=yes") // Keep master alive
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", CONNECT_TIMEOUT_SECS))
         .arg("-o")
         .arg("ServerAliveInterval=5")
         .arg("-o")
@@ -65,6 +73,8 @@ pub async fn ssh_forward_add(
 
     let output = Command::new("ssh")
         .args(&ctx.ssh_args)
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", CONNECT_TIMEOUT_SECS))
         .arg("-S")
         .arg(ctx.control_path.to_string_lossy().to_string())
         .arg("-O")
@@ -99,6 +109,8 @@ pub async fn ssh_forward_cancel(
 
     let output = Command::new("ssh")
         .args(&ctx.ssh_args)
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", CONNECT_TIMEOUT_SECS))
         .arg("-S")
         .arg(ctx.control_path.to_string_lossy().to_string())
         .arg("-O")
@@ -123,8 +135,14 @@ pub async fn ssh_forward_cancel(
 
 /// Check if the ControlMaster is still alive.
 pub async fn ssh_master_check(ctx: &SshContext) -> bool {
+    if !ctx.control_path.exists() {
+        return false;
+    }
+
     Command::new("ssh")
         .args(&ctx.ssh_args)
+        .arg("-o")
+        .arg(format!("ConnectTimeout={}", CONNECT_TIMEOUT_SECS))
         .arg("-S")
         .arg(ctx.control_path.to_string_lossy().to_string())
         .arg("-O")

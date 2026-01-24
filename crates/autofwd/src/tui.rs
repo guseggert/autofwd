@@ -606,6 +606,22 @@ fn format_event(event: &JsonEvent) -> String {
         } => {
             format!("{} [timing] {} {}ms", ts.to_rfc3339(), phase, duration_ms)
         }
+        Event::AgentDiagnostics {
+            ts,
+            backend,
+            phase,
+            sleep_ms,
+            min_ms,
+            max_ms,
+        } => format!(
+            "{} [agent] {} {} sleep={}ms (min={}ms max={}ms)",
+            ts.to_rfc3339(),
+            backend,
+            phase,
+            sleep_ms,
+            min_ms,
+            max_ms
+        ),
     }
 }
 

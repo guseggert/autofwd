@@ -62,6 +62,15 @@ pub enum Event {
         phase: String,
         duration_ms: u64,
     },
+    /// Optional agent diagnostics (emitted only when AUTOFWD_DEBUG_EVENTS is set)
+    AgentDiagnostics {
+        ts: DateTime<Utc>,
+        backend: String,
+        phase: String,
+        sleep_ms: u64,
+        min_ms: u64,
+        max_ms: u64,
+    },
 }
 
 impl Event {
@@ -180,6 +189,23 @@ impl Event {
             ts: Utc::now(),
             phase: phase.to_string(),
             duration_ms,
+        }
+    }
+
+    pub fn agent_diagnostics(
+        backend: &str,
+        phase: &str,
+        sleep_ms: u64,
+        min_ms: u64,
+        max_ms: u64,
+    ) -> Self {
+        Event::AgentDiagnostics {
+            ts: Utc::now(),
+            backend: backend.to_string(),
+            phase: phase.to_string(),
+            sleep_ms,
+            min_ms,
+            max_ms,
         }
     }
 
