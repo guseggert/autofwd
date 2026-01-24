@@ -29,7 +29,7 @@ mod linux {
     const INET_DIAG_MSG_MIN_LEN: usize = 72;
 
     fn io_err(msg: &'static str) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, msg)
+        io::Error::other(msg)
     }
 
     fn open_sock() -> io::Result<OwnedFd> {
@@ -40,7 +40,7 @@ mod linux {
             SockFlag::empty(),
             SockProtocol::NetlinkSockDiag,
         )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
     }
 
     fn write_u16_ne(dst: &mut [u8], off: usize, v: u16) -> bool {
@@ -108,7 +108,7 @@ mod linux {
         let addr = NetlinkAddr::new(0, 0);
         sendto(fd, &buf, &addr, MsgFlags::empty())
             .map(|_| ())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     }
 
     fn recv_msgs(fd: RawFd, seq: u32, out: &mut Vec<ListeningSocket>) -> io::Result<()> {
@@ -116,7 +116,7 @@ mod linux {
 
         loop {
             let rc = nix::sys::socket::recv(fd, &mut buf, MsgFlags::empty())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             if rc == 0 {
                 return Err(io_err("netlink: EOF"));
             }

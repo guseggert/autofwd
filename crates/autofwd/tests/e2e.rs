@@ -841,6 +841,17 @@ fn test_agent_backoff_emits_diagnostics() -> Result<()> {
 #[test]
 fn test_agent_netlink_backend_used() -> Result<()> {
     // Verifies that netlink sock_diag is used by default when available.
+    // Skip on QEMU-emulated platforms where netlink syscalls may not work properly.
+    if let Ok(platform) = std::env::var("AUTOFWD_TEST_PLATFORM") {
+        if platform != "linux/amd64" {
+            println!(
+                "Skipping test_agent_netlink_backend_used - netlink unreliable under QEMU ({})",
+                platform
+            );
+            return Ok(());
+        }
+    }
+
     if !agents_available() {
         println!("Skipping test_agent_netlink_backend_used - agents not available");
         return Ok(());
