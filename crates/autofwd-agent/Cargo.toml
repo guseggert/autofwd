@@ -8,3 +8,4 @@ description = "Server-side agent for autofwd port monitoring"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+nix = { version = "0.29", features = ["socket"] }

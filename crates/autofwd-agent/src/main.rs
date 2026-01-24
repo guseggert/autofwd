@@ -8,12 +8,33 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, thread};
+
+mod netlink;
 
 const END_MARKER: &str = "__AUTOFWD_END__";
 const HEARTBEAT_MARKER: &str = "__AUTOFWD_HEARTBEAT__";
+const DEBUG_MARKER: &str = "__AUTOFWD_DEBUG__";
 const NUM_THREADS: usize = 4;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Serialize)]
+struct DebugEvent<'a> {
+    /// "netlink" or "proc"
+    backend: &'a str,
+    /// "backoff" or "reset"
+    phase: &'a str,
+    sleep_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketBackend {
+    Netlink,
+    Proc,
+}
 
 /// Information about a listening port.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -33,7 +54,7 @@ pub struct Snapshot {
 
 /// A listening socket from /proc/net/tcp.
 #[derive(Debug, Clone)]
-struct ListeningSocket {
+pub(crate) struct ListeningSocket {
     port: u16,
     inode: u64,
     is_v6: bool,
@@ -41,6 +62,7 @@ struct ListeningSocket {
 
 /// Port monitor with caching for efficient repeated polling.
 struct PortMonitor {
+    backend: SocketBackend,
     /// Cache: inode → (pid, process_name)
     inode_cache: HashMap<u64, (u32, String)>,
     /// Inodes seen in the last poll
@@ -50,18 +72,42 @@ struct PortMonitor {
 }
 
 impl PortMonitor {
-    fn new() -> Self {
+    fn new(backend: SocketBackend) -> Self {
         Self {
+            backend,
             inode_cache: HashMap::new(),
             last_inodes: HashSet::new(),
             last_snapshot_key: String::new(),
         }
     }
 
+    fn backend_str(&self) -> &'static str {
+        match self.backend {
+            SocketBackend::Netlink => "netlink",
+            SocketBackend::Proc => "proc",
+        }
+    }
+
+    fn read_sockets(&mut self) -> Vec<ListeningSocket> {
+        match self.backend {
+            SocketBackend::Netlink => {
+                // If netlink isn't available/allowed, fall back to /proc and stick with it.
+                match netlink::list_listening_sockets() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        self.backend = SocketBackend::Proc;
+                        read_listening_sockets_proc()
+                    }
+                }
+            }
+            SocketBackend::Proc => read_listening_sockets_proc(),
+        }
+    }
+
     /// Poll for port changes. Returns Some(snapshot) if changed, None otherwise.
     fn poll(&mut self) -> Option<Snapshot> {
         // 1. Read listening sockets from /proc/net/tcp{,6}
-        let sockets = read_listening_sockets();
+        let sockets = self.read_sockets();
 
         // 2. Build current state
         let current_inodes: HashSet<u64> = sockets.iter().map(|s| s.inode).collect();
@@ -150,7 +196,7 @@ fn snapshot_key(snapshot: &Snapshot) -> String {
 // =============================================================================
 
 /// Read listening sockets from /proc/net/tcp and /proc/net/tcp6.
-fn read_listening_sockets() -> Vec<ListeningSocket> {
+fn read_listening_sockets_proc() -> Vec<ListeningSocket> {
     let mut sockets = Vec::new();
 
     // Read IPv4
@@ -333,14 +379,27 @@ fn print_usage() {
     eprintln!("Usage: autofwd-agent [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --interval <MS>    Polling interval in milliseconds (default: 500)");
+    eprintln!("  --interval <MS>    Minimum polling interval in milliseconds (default: 500)");
+    eprintln!("  --max-interval <MS> Maximum interval when idle (default: 5000)");
     eprintln!("  --version          Print version and exit");
     eprintln!("  --help             Print this help message");
+}
+
+fn backoff_next(current: Duration, max: Duration) -> Duration {
+    // Exponential backoff (x2) capped at max.
+    current
+        .checked_mul(2)
+        .unwrap_or(max)
+        .min(max)
+        .max(Duration::from_millis(1))
 }
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut interval_ms: u64 = 500;
+    let mut max_interval_ms: u64 = 5000;
+    let debug_enabled = env::var_os("AUTOFWD_AGENT_DEBUG").is_some();
+    let netlink_disabled = env::var_os("AUTOFWD_AGENT_DISABLE_NETLINK").is_some();
 
     let mut i = 1;
     while i < args.len() {
@@ -364,6 +423,17 @@ fn main() {
                     std::process::exit(1);
                 });
             }
+            "--max-interval" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --max-interval requires a value");
+                    std::process::exit(1);
+                }
+                max_interval_ms = args[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Error: invalid max interval value");
+                    std::process::exit(1);
+                });
+            }
             arg => {
                 eprintln!("Error: unknown argument: {}", arg);
                 print_usage();
@@ -373,11 +443,21 @@ fn main() {
         i += 1;
     }
 
-    let interval = Duration::from_millis(interval_ms);
-    let heartbeat_threshold = (5000 / interval_ms).max(1) as u32;
+    // Interval semantics:
+    // - --interval is the minimum polling interval (fastest).
+    // - When idle (no changes), we back off up to --max-interval.
+    let min_interval = Duration::from_millis(interval_ms.max(1));
+    let max_interval = Duration::from_millis(max_interval_ms.max(1)).max(min_interval);
 
-    let mut monitor = PortMonitor::new();
-    let mut heartbeat_counter: u32 = 0;
+    let backend = if netlink_disabled || !cfg!(target_os = "linux") {
+        SocketBackend::Proc
+    } else {
+        SocketBackend::Netlink
+    };
+    let mut monitor = PortMonitor::new(backend);
+    let mut sleep_interval = min_interval;
+    let mut last_output = Instant::now();
+    let mut last_debug_sleep_ms: Option<u64> = None;
 
     loop {
         match monitor.poll() {
@@ -385,19 +465,61 @@ fn main() {
                 // State changed - emit snapshot
                 println!("{}", serde_json::to_string(&snapshot).unwrap_or_default());
                 println!("{}", END_MARKER);
-                heartbeat_counter = 0;
+                last_output = Instant::now();
+                sleep_interval = min_interval;
+
+                if debug_enabled {
+                    let sleep_ms = sleep_interval.as_millis() as u64;
+                    if last_debug_sleep_ms != Some(sleep_ms) {
+                        let ev = DebugEvent {
+                            backend: monitor.backend_str(),
+                            phase: "reset",
+                            sleep_ms,
+                            min_ms: min_interval.as_millis() as u64,
+                            max_ms: max_interval.as_millis() as u64,
+                        };
+                        println!(
+                            "{} {}",
+                            DEBUG_MARKER,
+                            serde_json::to_string(&ev).unwrap_or_default()
+                        );
+                        last_debug_sleep_ms = Some(sleep_ms);
+                    }
+                }
             }
             None => {
-                // No change - maybe send heartbeat
-                heartbeat_counter += 1;
-                if heartbeat_counter >= heartbeat_threshold {
+                // No change - send heartbeat periodically to prove liveness to the caller.
+                if last_output.elapsed() >= HEARTBEAT_INTERVAL {
                     println!("{}", HEARTBEAT_MARKER);
-                    heartbeat_counter = 0;
+                    last_output = Instant::now();
                 }
             }
         }
 
-        thread::sleep(interval);
+        thread::sleep(sleep_interval);
+
+        // Only back off when idle. If we emitted a snapshot, sleep_interval was reset above.
+        let next_sleep = backoff_next(sleep_interval, max_interval);
+        if debug_enabled {
+            let next_ms = next_sleep.as_millis() as u64;
+            if next_ms != sleep_interval.as_millis() as u64 && last_debug_sleep_ms != Some(next_ms)
+            {
+                let ev = DebugEvent {
+                    backend: monitor.backend_str(),
+                    phase: "backoff",
+                    sleep_ms: next_ms,
+                    min_ms: min_interval.as_millis() as u64,
+                    max_ms: max_interval.as_millis() as u64,
+                };
+                println!(
+                    "{} {}",
+                    DEBUG_MARKER,
+                    serde_json::to_string(&ev).unwrap_or_default()
+                );
+                last_debug_sleep_ms = Some(next_ms);
+            }
+        }
+        sleep_interval = next_sleep;
     }
 }
 
