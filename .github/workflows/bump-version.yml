@@ -19,15 +19,20 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # Step 1: Bump version, commit, and tag
   bump:
-    name: Bump version and tag
+    name: Bump version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Determine new version
         id: version
@@ -48,6 +53,7 @@ jobs:
 
           echo "New version: $new"
           echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "tag=v$new" >> "$GITHUB_OUTPUT"
 
       - name: Update Cargo.toml
         run: |
@@ -64,3 +70,146 @@ jobs:
           git commit -m "release: v${{ steps.version.outputs.version }}"
           git tag "v${{ steps.version.outputs.version }}"
           git push origin main --tags
+
+  # Step 2: Build agent binaries for all Linux targets
+  build-agents:
+    name: Build Agents
+    needs: bump
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install zstd
+        run: sudo apt-get install -y zstd
+
+      - name: Build agents
+        run: |
+          mkdir -p target/agents
+
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
+            echo "Building agent for $target..."
+            cross build --release --target "$target" -p autofwd-agent
+
+            # Strip the binary
+            docker run --rm -v "$(pwd):/work" -w /work "ghcr.io/cross-rs/$target:main" \
+              strip "target/$target/release/autofwd-agent" || true
+
+            # Compress with zstd
+            zstd -19 -f "target/$target/release/autofwd-agent" -o "target/agents/$target.zst"
+          done
+
+          echo "Agent sizes:"
+          ls -lh target/agents/
+
+      - name: Upload agents
+        uses: actions/upload-artifact@v4
+        with:
+          name: agents
+          path: target/agents/
+
+  # Step 3: Build main binary for each platform
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [bump, build-agents]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
+
+      - name: Download agents
+        uses: actions/download-artifact@v4
+        with:
+          name: agents
+          path: target/agents/
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }} -p autofwd
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }} -p autofwd
+
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czvf ../../../autofwd-${{ matrix.target }}.tar.gz autofwd
+          cd -
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: autofwd-${{ matrix.target }}
+          path: autofwd-${{ matrix.target }}.tar.gz
+
+  # Step 4: Create GitHub Release
+  release:
+    name: Create Release
+    needs: [bump, build]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          mv artifacts/autofwd-*/*.tar.gz release/
+          cd release
+          sha256sum *.tar.gz > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.bump.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/checksums-sha256.txt
