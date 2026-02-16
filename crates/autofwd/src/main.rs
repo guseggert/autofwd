@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
 
     // Start SSH control master
     let ssh_start = Instant::now();
-    ssh_master_start(&ctx).await?;
+    ssh_master_start(&ctx, true).await?;
     let ssh_duration = ssh_start.elapsed();
 
     // Emit timing in headless mode

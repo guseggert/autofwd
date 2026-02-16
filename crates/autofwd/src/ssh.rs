@@ -25,7 +25,7 @@ pub fn control_path_for(target: &str) -> PathBuf {
 }
 
 /// Start the SSH ControlMaster in the background.
-pub async fn ssh_master_start(ctx: &SshContext) -> Result<()> {
+pub async fn ssh_master_start(ctx: &SshContext, inherit_stderr: bool) -> Result<()> {
     // If a previous run crashed or the machine slept, the control socket file may be stale.
     // Remove it proactively so we can always restart the master.
     let _ = std::fs::remove_file(&ctx.control_path);
@@ -47,16 +47,40 @@ pub async fn ssh_master_start(ctx: &SshContext) -> Result<()> {
         .arg(ctx.control_path.to_string_lossy().to_string())
         .arg(&ctx.target)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::null());
 
-    let status = cmd
-        .status()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to start ssh master: {e}"))?;
+    if inherit_stderr {
+        // At startup (before TUI), let the user see SSH auth prompts and errors directly.
+        cmd.stderr(Stdio::inherit());
+        let status = cmd
+            .status()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to start ssh master: {e}"))?;
 
-    if !status.success() {
-        bail!("ssh master exited with status {status}");
+        if !status.success() {
+            bail!("ssh master exited with status {status}");
+        }
+    } else {
+        // During reconnection (while TUI is active), capture stderr to avoid polluting
+        // the terminal's scrollback buffer. With `-f`, SSH forks into the background after
+        // auth — the forked process inherits the pipe fd whose read end is closed, so its
+        // writes are silently discarded (SIGPIPE/EPIPE). This prevents the long-running
+        // master process from continuously writing to the terminal and causing iTerm lag.
+        cmd.stderr(Stdio::piped());
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to start ssh master: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                bail!("ssh master exited with status {}", output.status);
+            } else {
+                bail!("ssh master failed: {msg}");
+            }
+        }
     }
     Ok(())
 }

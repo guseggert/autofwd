@@ -674,7 +674,7 @@ pub async fn run_monitor(
                     }
 
                     // Try to restart the ControlMaster
-                    if let Err(e) = ssh_master_start(&ctx).await {
+                    if let Err(e) = ssh_master_start(&ctx, false).await {
                         let mut tui = tui_state.write().await;
                         tui.push_event(Event::error(format!("reconnect failed: {}", e)));
                         tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
@@ -836,7 +836,7 @@ pub async fn run_monitor(
                         // After sleep/wake the ControlMaster often gets "wedged" (socket exists but no traffic).
                         // Restarting it is the most reliable recovery strategy.
                         let _ = std::fs::remove_file(&ctx.control_path);
-                        if let Err(e) = ssh_master_start(&ctx).await {
+                        if let Err(e) = ssh_master_start(&ctx, false).await {
                             let mut tui = tui_state.write().await;
                             tui.push_event(Event::error(format!("reconnect failed: {}", e)));
                             tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
