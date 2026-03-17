@@ -11,6 +11,7 @@ use ratatui::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
     },
 };
+use std::collections::VecDeque;
 use std::io::{stdout, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -54,18 +55,21 @@ pub enum MonitorModeDisplay {
 }
 
 /// Shared state between the monitor and the TUI.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TuiState {
     pub status: String,
     pub forwarded: Vec<ForwardedPort>,
     pub should_quit: bool,
     pub selected: usize,
-    pub events: Vec<JsonEvent>,
+    pub events: VecDeque<JsonEvent>,
     /// Current monitoring mode (agent or shell fallback).
     pub monitor_mode: MonitorModeDisplay,
     /// Optional channel for JSON events (headless mode)
     #[allow(dead_code)]
     event_tx: Option<EventSender>,
+    pub snapshots_processed: u64,
+    pub ssh_ops: u64,
+    pub active_probes: u32,
 }
 
 impl TuiState {
@@ -75,9 +79,9 @@ impl TuiState {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(event.clone());
         }
-        self.events.push(event);
+        self.events.push_back(event);
         if self.events.len() > MAX_EVENTS {
-            self.events.remove(0);
+            self.events.pop_front();
         }
     }
 
@@ -90,18 +94,76 @@ impl TuiState {
 }
 
 /// Local UI state (not shared with monitor).
-#[derive(Debug, Default)]
 struct UiState {
     show_help: bool,
     show_process: bool,
     show_quit_confirm: bool,
+    show_debug: bool,
     table_state: TableState,
-    // Events view state
     events_view: bool,
     events_list_state: ListState,
     events_filter: String,
     events_filter_active: bool,
     events_auto_follow: bool,
+    render_stats: RenderStats,
+}
+
+struct RenderStats {
+    start_time: Instant,
+    frame_count: u64,
+    last_frame_time: Duration,
+    fps_window_start: Instant,
+    fps_window_frames: u64,
+    current_fps: f64,
+    key_events: u64,
+    tick_events: u64,
+    state_change_events: u64,
+    resize_events: u64,
+    coalesced_events: u64,
+}
+
+impl RenderStats {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            start_time: now,
+            frame_count: 0,
+            last_frame_time: Duration::ZERO,
+            fps_window_start: now,
+            fps_window_frames: 0,
+            current_fps: 0.0,
+            key_events: 0,
+            tick_events: 0,
+            state_change_events: 0,
+            resize_events: 0,
+            coalesced_events: 0,
+        }
+    }
+
+    fn record_event(&mut self, event: &TuiEvent) {
+        match event {
+            TuiEvent::Key(_) => self.key_events += 1,
+            TuiEvent::Tick => self.tick_events += 1,
+            TuiEvent::StateChanged => self.state_change_events += 1,
+            TuiEvent::Resize => self.resize_events += 1,
+        }
+    }
+
+    fn record_frame(&mut self, frame_time: Duration) {
+        self.frame_count += 1;
+        self.last_frame_time = frame_time;
+        self.fps_window_frames += 1;
+        let elapsed = self.fps_window_start.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            self.current_fps = self.fps_window_frames as f64 / elapsed.as_secs_f64();
+            self.fps_window_frames = 0;
+            self.fps_window_start = Instant::now();
+        }
+    }
+
+    fn uptime(&self) -> Duration {
+        self.start_time.elapsed()
+    }
 }
 
 pub type SharedState = Arc<RwLock<TuiState>>;
@@ -131,9 +193,12 @@ pub fn new_shared_state(event_tx: Option<EventSender>) -> (SharedState, RedrawNo
         forwarded: Vec::new(),
         should_quit: false,
         selected: 0,
-        events: Vec::new(),
+        events: VecDeque::new(),
         monitor_mode: MonitorModeDisplay::Unknown,
         event_tx,
+        snapshots_processed: 0,
+        ssh_ops: 0,
+        active_probes: 0,
     }));
     let notify = Arc::new(tokio::sync::Notify::new());
     (state, notify)
@@ -175,13 +240,10 @@ impl Tui {
             let area = frame.area();
 
             if ui.events_view {
-                // Full-screen events view
                 render_events_view(frame, area, state, ui);
             } else {
-                // Main view
                 render_main_view(frame, area, state, ui, target);
 
-                // Render overlays on top
                 if ui.show_help {
                     render_help_overlay(frame, area);
                 }
@@ -189,6 +251,10 @@ impl Tui {
                 if ui.show_quit_confirm {
                     render_quit_confirm(frame, area);
                 }
+            }
+
+            if ui.show_debug {
+                render_debug_overlay(frame, area, state, &ui.render_stats);
             }
         })?;
         Ok(())
@@ -331,7 +397,7 @@ fn render_main_view(
     frame.render_stateful_widget(table, chunks[1], &mut ui.table_state);
 
     // Footer
-    let footer = Paragraph::new(" ↑/↓ navigate • space toggle • ? help • q quit")
+    let footer = Paragraph::new(" ↑/↓ navigate • space toggle • d debug • ? help • q quit")
         .style(Style::default().fg(Color::DarkGray))
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
@@ -453,6 +519,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "  ↓/j/^N   Move selection down",
         "  Space    Toggle port forwarding",
         "  p        Toggle process column",
+        "  d        Toggle debug stats",
         "  e        Open events view",
         "  ?        Show/hide this help",
         "  q/Esc    Quit (with confirmation)",
@@ -502,6 +569,94 @@ fn render_quit_confirm(frame: &mut Frame, area: Rect) {
                 .title(" Quit? "),
         );
     frame.render_widget(confirm, popup_area);
+}
+
+fn render_debug_overlay(frame: &mut Frame, area: Rect, state: &TuiState, stats: &RenderStats) {
+    let uptime = stats.uptime();
+    let uptime_str = format_duration(uptime);
+    let fwd_active = state.forwarded.iter().filter(|f| f.enabled).count();
+    let fwd_total = state.forwarded.len();
+
+    let mode_str = match state.monitor_mode {
+        MonitorModeDisplay::Agent => "agent",
+        MonitorModeDisplay::Shell => "shell",
+        MonitorModeDisplay::Unknown => "?",
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("  Render  ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(format!(
+                "fps {:.1}  frame {:.1}ms",
+                stats.current_fps,
+                stats.last_frame_time.as_secs_f64() * 1000.0
+            )),
+        ]),
+        Line::from(vec![
+            Span::raw("          "),
+            Span::raw(format!(
+                "total {}  coalesced {}",
+                stats.frame_count, stats.coalesced_events
+            )),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Events  ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(format!(
+                "key {}  tick {}  state {}",
+                stats.key_events, stats.tick_events, stats.state_change_events
+            )),
+        ]),
+        Line::from(vec![
+            Span::raw("          "),
+            Span::raw(format!(
+                "resize {}  buf {}/{}",
+                stats.resize_events,
+                state.events.len(),
+                MAX_EVENTS
+            )),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Monitor ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(format!(
+                "{}  fwds {}/{}  snaps {}",
+                mode_str, fwd_active, fwd_total, state.snapshots_processed
+            )),
+        ]),
+        Line::from(vec![
+            Span::raw("          "),
+            Span::raw(format!(
+                "probes {}  ssh_ops {}",
+                state.active_probes, state.ssh_ops
+            )),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Uptime  ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(uptime_str),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("                        "),
+            Span::styled("[d] close", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let popup_width = 44;
+    let popup_height = lines.len() as u16 + 2;
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+    let debug = Paragraph::new(lines)
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" Debug Stats "),
+        );
+    frame.render_widget(debug, popup_area);
 }
 
 fn format_duration(d: Duration) -> String {
@@ -686,14 +841,16 @@ pub async fn run_tui(
     let mut tui = Tui::new()?;
     let mut ui = UiState {
         show_help: false,
-        show_process: false, // Process column hidden by default
+        show_process: false,
         show_quit_confirm: false,
+        show_debug: false,
         table_state: TableState::default(),
         events_view: false,
         events_list_state: ListState::default(),
         events_filter: String::new(),
         events_filter_active: false,
         events_auto_follow: true,
+        render_stats: RenderStats::new(),
     };
 
     // Unified event channel - all events flow through here
@@ -705,28 +862,39 @@ pub async fn run_tui(
         tui.draw(&s, &mut ui, &target)?;
     }
 
-    // Main event loop - simple recv from unified channel
+    // Main event loop with event coalescing.
+    // Drains all pending events before drawing once per batch,
+    // preventing redundant redraws when multiple events arrive between frames.
     while let Some(event) = events.recv().await {
-        // Check for quit (set by Ctrl+C signal handler)
         if state.read().await.should_quit {
             break;
         }
 
-        match event {
-            TuiEvent::Key(key) => {
-                handle_key_event(key, &state, &mut ui, &cmd_tx).await;
-            }
-            TuiEvent::Resize | TuiEvent::Tick | TuiEvent::StateChanged => {
-                // Just redraw below
+        ui.render_stats.record_event(&event);
+        if let TuiEvent::Key(key) = event {
+            handle_key_event(key, &state, &mut ui, &cmd_tx).await;
+        }
+
+        loop {
+            match events.try_recv() {
+                Ok(ev) => {
+                    ui.render_stats.record_event(&ev);
+                    ui.render_stats.coalesced_events += 1;
+                    if let TuiEvent::Key(key) = ev {
+                        handle_key_event(key, &state, &mut ui, &cmd_tx).await;
+                    }
+                }
+                Err(_) => break,
             }
         }
 
-        // Redraw after every event
         let s = state.read().await;
         if s.should_quit {
             break;
         }
+        let draw_start = Instant::now();
         tui.draw(&s, &mut ui, &target)?;
+        ui.render_stats.record_frame(draw_start.elapsed());
     }
 
     Ok(())
@@ -807,6 +975,9 @@ async fn handle_key_event(
             }
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 ui.show_process = !ui.show_process;
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                ui.show_debug = !ui.show_debug;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let mut s = state.write().await;
@@ -924,11 +1095,13 @@ async fn handle_events_view_keys(key: KeyEvent, state: &SharedState, ui: &mut Ui
             }
         }
         KeyCode::End | KeyCode::Char('G') => {
-            // Moving to end enables auto-follow
             ui.events_auto_follow = true;
             if total > 0 {
                 ui.events_list_state.select(Some(total - 1));
             }
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            ui.show_debug = !ui.show_debug;
         }
         _ => {}
     }

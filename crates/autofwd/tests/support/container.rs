@@ -20,8 +20,8 @@ pub fn get_test_platform() -> Option<String> {
 
 /// Container types for protocol detection testing.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub enum ContainerType {
-    /// Our custom SSH test image
     Ssh,
     /// redis:alpine
     Redis,
@@ -62,12 +62,13 @@ impl ContainerType {
         }
     }
 
+    #[allow(dead_code)]
     pub fn expected_protocol(&self) -> &str {
         match self {
             Self::Ssh => "ssh",
             Self::Redis => "redis",
             Self::PostgreSql => "postgresql",
-            Self::MariaDb => "mysql", // MariaDB uses MySQL protocol
+            Self::MariaDb => "mysql",
             Self::Http => "http",
         }
     }
@@ -203,7 +204,7 @@ impl ServiceContainer {
         self.container_type.internal_port()
     }
 
-    /// Get the expected protocol string.
+    #[allow(dead_code)]
     pub fn expected_protocol(&self) -> &str {
         self.container_type.expected_protocol()
     }
@@ -282,6 +283,7 @@ pub struct TestContainer {
     container_id: String,
     container_name: String,
     ssh_port: u16,
+    #[allow(dead_code)]
     network: Option<String>,
     /// Kept alive to prevent TempDir from being dropped (deleting keys)
     _key_dir: TempDir,

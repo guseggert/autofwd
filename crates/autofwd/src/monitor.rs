@@ -145,11 +145,11 @@ async fn process_snapshot(
     assume_http: bool,
     tui_state: &SharedState,
 ) {
-    // Parse the accumulated output
+    tui_state.write().await.snapshots_processed += 1;
+
     let output = state.snapshot_lines.join("\n");
     state.snapshot_lines.clear();
 
-    // Parse based on monitoring mode
     let snapshot = match &state.mode {
         MonitorMode::Agent { .. } => parse_agent_output(&output),
         MonitorMode::Shell => parse_proc_net_output(&output),
@@ -198,6 +198,7 @@ async fn process_snapshot(
             // Re-probe protocol on restart if not assume_http
             if !assume_http {
                 if let Some(local_port) = local_port {
+                    tui_state.write().await.active_probes += 1;
                     let tui_state_clone = tui_state.clone();
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -213,6 +214,7 @@ async fn process_snapshot(
                         if detected != Protocol::Unknown {
                             tui.push_event(Event::protocol_detected(local_port, detected.as_str()));
                         }
+                        tui.active_probes = tui.active_probes.saturating_sub(1);
                     });
                 }
             }
@@ -275,8 +277,8 @@ async fn process_snapshot(
                     Protocol::Unknown
                 };
 
-                // Update TUI state
                 let mut tui = tui_state.write().await;
+                tui.ssh_ops += 1;
                 tui.forwarded.push(ForwardedPort {
                     remote_port,
                     local_port,
@@ -298,12 +300,11 @@ async fn process_snapshot(
 
                 // Spawn protocol detection task if not assume_http
                 if !assume_http {
+                    tui_state.write().await.active_probes += 1;
                     let tui_state_clone = tui_state.clone();
                     tokio::spawn(async move {
-                        // Delay to let the forward establish and service respond
                         tokio::time::sleep(Duration::from_millis(500)).await;
 
-                        // Try detection multiple times with increasing delays
                         let mut detected = Protocol::Unknown;
                         for attempt in 0..3 {
                             if attempt > 0 {
@@ -315,7 +316,6 @@ async fn process_snapshot(
                             }
                         }
 
-                        // Update the ForwardedPort with detected protocol
                         let mut tui = tui_state_clone.write().await;
                         if let Some(fwd) = tui
                             .forwarded
@@ -324,10 +324,10 @@ async fn process_snapshot(
                         {
                             fwd.protocol = detected;
                         }
-                        // Push event for detected protocol
                         if detected != Protocol::Unknown {
                             tui.push_event(Event::protocol_detected(local_port, detected.as_str()));
                         }
+                        tui.active_probes = tui.active_probes.saturating_sub(1);
                     });
                 }
             }
@@ -351,11 +351,10 @@ async fn process_snapshot(
 
     for remote_port in gone_ports {
         if let Some(info) = state.forwards.remove(&remote_port) {
-            // Cancel the SSH forward
             let _ = ssh_forward_cancel(ctx, info.local_port, &info.remote_host, remote_port).await;
 
-            // Remove from TUI
             let mut tui = tui_state.write().await;
+            tui.ssh_ops += 1;
             tui.forwarded.retain(|f| f.remote_port != remote_port);
 
             // Update status
@@ -397,11 +396,11 @@ async fn handle_toggle(
     };
 
     if is_enabled {
-        // Disable: cancel the forward via ControlMaster
         match ssh_forward_cancel(ctx, local_port, &remote_host, port).await {
             Ok(()) => {
                 state.forwards.remove(&port);
                 let mut tui = tui_state.write().await;
+                tui.ssh_ops += 1;
                 if let Some(fwd) = tui.forwarded.iter_mut().find(|f| f.remote_port == port) {
                     fwd.enabled = false;
                 }
@@ -417,7 +416,6 @@ async fn handle_toggle(
             }
         }
     } else {
-        // Enable: add the forward via ControlMaster
         match ssh_forward_add(ctx, local_port, &remote_host, port).await {
             Ok(()) => {
                 state.forwards.insert(
@@ -429,6 +427,7 @@ async fn handle_toggle(
                 );
 
                 let mut tui = tui_state.write().await;
+                tui.ssh_ops += 1;
                 if let Some(fwd) = tui.forwarded.iter_mut().find(|f| f.remote_port == port) {
                     fwd.enabled = true;
                 }
