@@ -875,16 +875,11 @@ pub async fn run_tui(
             handle_key_event(key, &state, &mut ui, &cmd_tx).await;
         }
 
-        loop {
-            match events.try_recv() {
-                Ok(ev) => {
-                    ui.render_stats.record_event(&ev);
-                    ui.render_stats.coalesced_events += 1;
-                    if let TuiEvent::Key(key) = ev {
-                        handle_key_event(key, &state, &mut ui, &cmd_tx).await;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(ev) = events.try_recv() {
+            ui.render_stats.record_event(&ev);
+            ui.render_stats.coalesced_events += 1;
+            if let TuiEvent::Key(key) = ev {
+                handle_key_event(key, &state, &mut ui, &cmd_tx).await;
             }
         }
 
