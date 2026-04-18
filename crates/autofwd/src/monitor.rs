@@ -11,7 +11,8 @@ use crate::ports::{find_free_local_port, PortFilter};
 use crate::probe::{detect_protocol, Protocol};
 use crate::proc_net::{parse_agent_output, parse_proc_net_output, remote_host_for, PortInfo};
 use crate::ssh::{
-    ssh_forward_add, ssh_forward_cancel, ssh_master_check, ssh_master_start, SshContext,
+    ssh_forward_add, ssh_forward_cancel, ssh_master_check, ssh_master_start,
+    ssh_master_terminate_existing, SshContext,
 };
 use crate::tui::{CommandReceiver, ForwardedPort, MonitorModeDisplay, SharedState, TuiCommand};
 
@@ -287,6 +288,8 @@ async fn process_snapshot(
                     enabled: true,
                     protocol,
                     process_name: process_name.clone(),
+                    last_verified_at: None,
+                    last_verified_ok: false,
                 });
                 tui.status = format!("watching ({} forwarded)", tui.forwarded.len());
                 tui.push_event(Event::forward_added(
@@ -297,6 +300,28 @@ async fn process_snapshot(
                     process_name,
                 ));
                 drop(tui);
+
+                // Verify the forward is actually listening locally. Runs in
+                // the background so it doesn't block the snapshot loop.
+                {
+                    let tui_state_clone = tui_state.clone();
+                    tokio::spawn(async move {
+                        // Tiny delay — ssh -O forward returns before the
+                        // kernel has fully set up the listening socket.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        let alive = verify_forward_alive(local_port).await;
+                        let mut tui = tui_state_clone.write().await;
+                        if let Some(fwd) = tui
+                            .forwarded
+                            .iter_mut()
+                            .find(|f| f.remote_port == remote_port)
+                        {
+                            fwd.last_verified_at = Some(Instant::now());
+                            fwd.last_verified_ok = alive;
+                        }
+                        tui.push_event(Event::forward_verified(remote_port, local_port, alive));
+                    });
+                }
 
                 // Spawn protocol detection task if not assume_http
                 if !assume_http {
@@ -525,35 +550,134 @@ async fn spawn_monitor_session(
     Ok((child, lines))
 }
 
-/// Re-establish all active forwards after a reconnection.
-async fn reestablish_forwards(ctx: &SshContext, state: &mut MonitorState, tui_state: &SharedState) {
-    let forwards_to_restore: Vec<_> = state.forwards.drain().collect();
+/// Maximum attempts to restore a single forward after reconnect.
+const RESTORE_MAX_ATTEMPTS: u32 = 5;
+/// Timeout for TCP verification connect.
+const VERIFY_TIMEOUT: Duration = Duration::from_millis(500);
+/// How often the background task re-verifies every active forward so the
+/// status overlay reflects current reality.
+const VERIFY_INTERVAL: Duration = Duration::from_secs(30);
 
-    for (remote_port, info) in forwards_to_restore {
-        match ssh_forward_add(ctx, info.local_port, &info.remote_host, remote_port).await {
+/// Verify that a local forward is actually bound by attempting a brief TCP
+/// connect to 127.0.0.1:<local_port>. Returns true if the connect succeeds.
+async fn verify_forward_alive(local_port: u16) -> bool {
+    tokio::time::timeout(
+        VERIFY_TIMEOUT,
+        tokio::net::TcpStream::connect(("127.0.0.1", local_port)),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
+}
+
+/// Try to restore a single forward with retries and verification.
+async fn restore_one_forward(
+    ctx: &SshContext,
+    remote_port: u16,
+    local_port: u16,
+    remote_host: &str,
+    tui_state: &SharedState,
+) -> std::result::Result<u32, (u32, String)> {
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=RESTORE_MAX_ATTEMPTS {
+        tui_state
+            .write()
+            .await
+            .push_event(Event::restore_attempt(
+                remote_port,
+                local_port,
+                attempt,
+                RESTORE_MAX_ATTEMPTS,
+            ));
+
+        match ssh_forward_add(ctx, local_port, remote_host, remote_port).await {
             Ok(()) => {
-                state.forwards.insert(
-                    remote_port,
-                    ForwardInfo {
-                        local_port: info.local_port,
-                        remote_host: info.remote_host,
-                    },
-                );
+                // Confirm the local socket is actually bound by something.
+                let alive = verify_forward_alive(local_port).await;
+                {
+                    let mut tui = tui_state.write().await;
+                    tui.push_event(Event::forward_verified(remote_port, local_port, alive));
+                    if let Some(fwd) = tui
+                        .forwarded
+                        .iter_mut()
+                        .find(|f| f.remote_port == remote_port)
+                    {
+                        fwd.last_verified_at = Some(Instant::now());
+                        fwd.last_verified_ok = alive;
+                    }
+                }
+                if alive {
+                    return Ok(attempt);
+                }
+                // Cancel whatever half-state ssh thinks it has, so next attempt
+                // can cleanly bind.
+                let _ = ssh_forward_cancel(ctx, local_port, remote_host, remote_port).await;
+                last_err = Some(format!(
+                    "ssh -O forward ok but local port {} not listening",
+                    local_port
+                ));
             }
             Err(e) => {
+                let msg = format!("{e}");
+                last_err = Some(msg);
+            }
+        }
+
+        if attempt < RESTORE_MAX_ATTEMPTS {
+            // Linear backoff: 150ms, 300ms, 450ms, 600ms.
+            tokio::time::sleep(Duration::from_millis(150 * attempt as u64)).await;
+        }
+    }
+
+    Err((
+        RESTORE_MAX_ATTEMPTS,
+        last_err.unwrap_or_else(|| "unknown error".to_string()),
+    ))
+}
+
+/// Re-establish all active forwards after a reconnection.
+///
+/// Forwards are kept in `state.forwards` across this call so that a transient
+/// failure doesn't permanently lose a forward — the next reconnect cycle will
+/// retry. Each forward is also TCP-verified after `ssh -O forward` to catch
+/// cases where SSH reports success but the socket isn't actually bound
+/// (e.g. port collision with a stale ssh process).
+async fn reestablish_forwards(ctx: &SshContext, state: &mut MonitorState, tui_state: &SharedState) {
+    let remote_ports: Vec<u16> = state.forwards.keys().copied().collect();
+
+    for remote_port in remote_ports {
+        let (local_port, remote_host) = {
+            let info = state.forwards.get(&remote_port).unwrap();
+            (info.local_port, info.remote_host.clone())
+        };
+
+        match restore_one_forward(ctx, remote_port, local_port, &remote_host, tui_state).await {
+            Ok(attempts) => {
                 let mut tui = tui_state.write().await;
-                tui.push_event(Event::error(format!(
-                    "restore :{} failed: {}",
-                    remote_port, e
-                )));
-                // Mark as disabled in TUI
+                tui.ssh_ops += 1;
+                // Update the TUI entry: restore enabled state, refresh age, clear any
+                // stale "disabled" status left over from prior silent-drop bug.
                 if let Some(fwd) = tui
                     .forwarded
                     .iter_mut()
                     .find(|f| f.remote_port == remote_port)
                 {
-                    fwd.enabled = false;
+                    fwd.enabled = true;
+                    fwd.forwarded_at = Instant::now();
                 }
+                tui.push_event(Event::forward_restored(remote_port, local_port, attempts));
+            }
+            Err((attempts, reason)) => {
+                // IMPORTANT: leave the forward in state.forwards so the next
+                // reconnect will retry. Do NOT mark the TUI entry disabled —
+                // that would cause process_snapshot to skip the port forever.
+                let mut tui = tui_state.write().await;
+                tui.push_event(Event::restore_failed(
+                    remote_port,
+                    local_port,
+                    attempts,
+                    reason,
+                ));
             }
         }
     }
@@ -640,16 +764,69 @@ pub async fn run_monitor(
     redraw_notify.notify_one(); // Show deployment result
 
     // Push ready event now that agent deployment is complete
-    tui_state
-        .write()
-        .await
-        .push_event(Event::ready(&ctx.target));
+    {
+        let mut tui = tui_state.write().await;
+        tui.push_event(Event::ready(&ctx.target));
+        tui.last_master_start = Some(Instant::now());
+    }
 
     let mut state = MonitorState::new(mode.clone());
     let mut reconnect_delay = Duration::from_secs(1);
     const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
     let stale_after = stale_after();
     let mut pending_reconnected_event = false;
+
+    // Background task: periodically re-verify every forward so the status
+    // overlay reflects current reality.
+    {
+        let tui_state_clone = tui_state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(VERIFY_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Skip the immediate first tick; initial verification happens at
+            // forward-add time.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if tui_state_clone.read().await.should_quit {
+                    break;
+                }
+                let ports: Vec<(u16, u16, bool)> = {
+                    let tui = tui_state_clone.read().await;
+                    tui.forwarded
+                        .iter()
+                        .map(|f| (f.remote_port, f.local_port, f.enabled))
+                        .collect()
+                };
+                for (remote_port, local_port, enabled) in ports {
+                    if !enabled {
+                        continue;
+                    }
+                    let alive = verify_forward_alive(local_port).await;
+                    let mut tui = tui_state_clone.write().await;
+                    if let Some(fwd) = tui
+                        .forwarded
+                        .iter_mut()
+                        .find(|f| f.remote_port == remote_port)
+                    {
+                        let previously_ok = fwd.last_verified_ok;
+                        let had_prior = fwd.last_verified_at.is_some();
+                        fwd.last_verified_at = Some(Instant::now());
+                        fwd.last_verified_ok = alive;
+                        // Only emit an event on state change or initial check
+                        // to keep the log readable.
+                        if !had_prior || previously_ok != alive {
+                            tui.push_event(Event::forward_verified(
+                                remote_port,
+                                local_port,
+                                alive,
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Outer loop handles reconnection
     'reconnect: loop {
@@ -672,7 +849,16 @@ pub async fn run_monitor(
                         pending_reconnected_event = true;
                     }
 
-                    // Try to restart the ControlMaster
+                    // Terminate any zombie master still holding ports, then start fresh.
+                    let term = ssh_master_terminate_existing(&ctx).await;
+                    if term.socket_existed {
+                        tui_state
+                            .write()
+                            .await
+                            .push_event(Event::master_terminated(term.summary(), term.killed_pid));
+                    }
+
+                    let master_start = Instant::now();
                     if let Err(e) = ssh_master_start(&ctx, false).await {
                         let mut tui = tui_state.write().await;
                         tui.push_event(Event::error(format!("reconnect failed: {}", e)));
@@ -682,6 +868,14 @@ pub async fn run_monitor(
                         tokio::time::sleep(reconnect_delay).await;
                         reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
                         continue 'reconnect;
+                    }
+                    {
+                        let mut tui = tui_state.write().await;
+                        tui.push_event(Event::master_started(
+                            master_start.elapsed().as_millis() as u64,
+                        ));
+                        tui.last_master_start = Some(Instant::now());
+                        tui.reconnect_count += 1;
                     }
 
                     // Re-establish forwards
@@ -730,6 +924,7 @@ pub async fn run_monitor(
                     match result {
                         Ok(Some(line)) => {
                             last_activity = Instant::now();
+                            tui_state.write().await.last_agent_activity = Some(last_activity);
                             let trimmed = line.trim();
                             if trimmed == END_MARKER {
                                 if pending_reconnected_event && !reconnected_emitted_this_session {
@@ -820,9 +1015,11 @@ pub async fn run_monitor(
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     if last_activity.elapsed() >= stale_after {
+                        let idle_ms = last_activity.elapsed().as_millis() as u64;
                         {
                             let mut tui = tui_state.write().await;
                             tui.status = "connection stale...".to_string();
+                            tui.push_event(Event::stale_detected(idle_ms));
                             tui.push_event(Event::connection_lost());
                             tui.push_event(Event::reconnecting(reconnect_delay.as_millis() as u64));
                             pending_reconnected_event = true;
@@ -832,9 +1029,17 @@ pub async fn run_monitor(
                         let _ = child.kill().await;
                         let _ = child.wait().await;
 
-                        // After sleep/wake the ControlMaster often gets "wedged" (socket exists but no traffic).
-                        // Restarting it is the most reliable recovery strategy.
-                        let _ = std::fs::remove_file(&ctx.control_path);
+                        // After sleep/wake the ControlMaster often gets "wedged" (socket exists but
+                        // no traffic), and in the real laptop-sleep case the old master is still
+                        // alive holding the local forward ports. Terminate it gracefully (then
+                        // SIGKILL if necessary) so the new master can rebind those ports.
+                        let term = ssh_master_terminate_existing(&ctx).await;
+                        tui_state
+                            .write()
+                            .await
+                            .push_event(Event::master_terminated(term.summary(), term.killed_pid));
+
+                        let master_start = Instant::now();
                         if let Err(e) = ssh_master_start(&ctx, false).await {
                             let mut tui = tui_state.write().await;
                             tui.push_event(Event::error(format!("reconnect failed: {}", e)));
@@ -844,6 +1049,13 @@ pub async fn run_monitor(
                             tokio::time::sleep(reconnect_delay).await;
                             reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
                             continue 'reconnect;
+                        }
+                        let master_duration_ms = master_start.elapsed().as_millis() as u64;
+                        {
+                            let mut tui = tui_state.write().await;
+                            tui.push_event(Event::master_started(master_duration_ms));
+                            tui.last_master_start = Some(Instant::now());
+                            tui.reconnect_count += 1;
                         }
 
                         reestablish_forwards(&ctx, &mut state, &tui_state).await;

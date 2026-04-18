@@ -20,6 +20,9 @@ ratatui = "0.29"
 tokio = { version = "1", features = ["full"] }
 zstd = "0.13"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 blake3 = "1"
 

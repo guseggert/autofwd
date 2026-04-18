@@ -71,6 +71,47 @@ pub enum Event {
         min_ms: u64,
         max_ms: u64,
     },
+    /// Stale connection detected by idle watchdog
+    StaleDetected { ts: DateTime<Utc>, idle_ms: u64 },
+    /// Pre-existing SSH master was cleaned up before starting a new one
+    MasterTerminated {
+        ts: DateTime<Utc>,
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        killed_pid: Option<u32>,
+    },
+    /// New SSH ControlMaster started
+    MasterStarted { ts: DateTime<Utc>, duration_ms: u64 },
+    /// Attempting to restore a forward after reconnect
+    RestoreAttempt {
+        ts: DateTime<Utc>,
+        remote_port: u16,
+        local_port: u16,
+        attempt: u32,
+        max_attempts: u32,
+    },
+    /// A forward was successfully restored
+    ForwardRestored {
+        ts: DateTime<Utc>,
+        remote_port: u16,
+        local_port: u16,
+        attempts: u32,
+    },
+    /// Restoring a forward failed after all retries
+    RestoreFailed {
+        ts: DateTime<Utc>,
+        remote_port: u16,
+        local_port: u16,
+        attempts: u32,
+        reason: String,
+    },
+    /// Forward was verified (TCP connect succeeded) or found broken
+    ForwardVerified {
+        ts: DateTime<Utc>,
+        remote_port: u16,
+        local_port: u16,
+        alive: bool,
+    },
 }
 
 impl Event {
@@ -206,6 +247,76 @@ impl Event {
             sleep_ms,
             min_ms,
             max_ms,
+        }
+    }
+
+    pub fn stale_detected(idle_ms: u64) -> Self {
+        Event::StaleDetected {
+            ts: Utc::now(),
+            idle_ms,
+        }
+    }
+
+    pub fn master_terminated(summary: impl Into<String>, killed_pid: Option<u32>) -> Self {
+        Event::MasterTerminated {
+            ts: Utc::now(),
+            summary: summary.into(),
+            killed_pid,
+        }
+    }
+
+    pub fn master_started(duration_ms: u64) -> Self {
+        Event::MasterStarted {
+            ts: Utc::now(),
+            duration_ms,
+        }
+    }
+
+    pub fn restore_attempt(
+        remote_port: u16,
+        local_port: u16,
+        attempt: u32,
+        max_attempts: u32,
+    ) -> Self {
+        Event::RestoreAttempt {
+            ts: Utc::now(),
+            remote_port,
+            local_port,
+            attempt,
+            max_attempts,
+        }
+    }
+
+    pub fn forward_restored(remote_port: u16, local_port: u16, attempts: u32) -> Self {
+        Event::ForwardRestored {
+            ts: Utc::now(),
+            remote_port,
+            local_port,
+            attempts,
+        }
+    }
+
+    pub fn restore_failed(
+        remote_port: u16,
+        local_port: u16,
+        attempts: u32,
+        reason: impl Into<String>,
+    ) -> Self {
+        Event::RestoreFailed {
+            ts: Utc::now(),
+            remote_port,
+            local_port,
+            attempts,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn forward_verified(remote_port: u16, local_port: u16, alive: bool) -> Self {
+        Event::ForwardVerified {
+            ts: Utc::now(),
+            remote_port,
+            local_port,
+            alive,
         }
     }
 

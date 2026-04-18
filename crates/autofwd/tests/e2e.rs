@@ -201,6 +201,35 @@ fn check_port(port: u16) -> bool {
     .is_ok()
 }
 
+/// Connect to local port and read a line; returns trimmed string if successful.
+/// `start_listener` publishes "ready\n" on each accept, so this verifies the
+/// forward is actually carrying traffic end-to-end (not just a locally bound
+/// socket by a now-dead master).
+fn read_line_from_port(port: u16) -> Result<String> {
+    use std::io::Read;
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", port).parse().unwrap(),
+        Duration::from_secs(3),
+    )?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf[..n]).trim().to_string())
+}
+
+/// Wait until data actually flows through the forward on the given port.
+/// Retries until timeout. Returns true if we got expected data, false otherwise.
+fn wait_for_forward_data(port: u16, expected: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match read_line_from_port(port) {
+            Ok(line) if line == expected => return true,
+            _ => std::thread::sleep(Duration::from_millis(300)),
+        }
+    }
+    false
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -985,4 +1014,319 @@ fn test_reconnect_after_container_pause() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[test]
+fn test_existing_forwards_restored_after_pause() -> Result<()> {
+    // Regression test for "tunnels not restored after laptop sleep/wake".
+    //
+    // Flow:
+    //   1. Start listener and let autofwd forward it.
+    //   2. Verify the local forwarded port works.
+    //   3. Pause container longer than AUTOFWD_STALE_MS.
+    //   4. Unpause.
+    //   5. Verify the SAME local port still works after reconnect.
+    if !agents_available() {
+        println!("Skipping test_existing_forwards_restored_after_pause - agents not available");
+        return Ok(());
+    }
+
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    let mut autofwd = AutofwdProcess::start_with_options(
+        &container,
+        "200ms",
+        &[],
+        &[
+            ("AUTOFWD_STALE_MS", "6000"),
+            ("AUTOFWD_AGENT_MAX_INTERVAL_MS", "500"),
+        ],
+    )?;
+
+    autofwd.wait_for_event("ready", Duration::from_secs(15))?;
+
+    // Establish a forward BEFORE the pause.
+    container.start_listener(7790)?;
+    let added = autofwd.wait_for_event("forward_added", Duration::from_secs(15))?;
+    let local_port = added
+        .get("local_port")
+        .and_then(|p| p.as_u64())
+        .expect("forward_added should have local_port") as u16;
+
+    // Verify data actually flows through the forward BEFORE the pause.
+    assert!(
+        wait_for_forward_data(local_port, "ready", Duration::from_secs(5)),
+        "forward on {} should carry data before pause",
+        local_port
+    );
+
+    // Simulate laptop sleep.
+    container.pause()?;
+    std::thread::sleep(Duration::from_secs(7));
+
+    autofwd.wait_for_event("connection_lost", Duration::from_secs(10))?;
+
+    container.unpause()?;
+
+    // Wait for autofwd to declare itself reconnected.
+    autofwd.wait_for_event("reconnected", Duration::from_secs(20))?;
+
+    // Data should flow through the SAME local port after reconnect. This
+    // catches the case where the port is still bound (by the old master) but
+    // the forward no longer actually carries traffic.
+    assert!(
+        wait_for_forward_data(local_port, "ready", Duration::from_secs(15)),
+        "existing forward on {} should still carry data after pause/unpause",
+        local_port
+    );
+
+    // And new forwards should still work.
+    container.start_listener(7791)?;
+    let event = autofwd.wait_for_event("forward_added", Duration::from_secs(20))?;
+    assert_eq!(
+        event.get("remote_port").and_then(|p| p.as_u64()),
+        Some(7791)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_forwards_restored_when_old_master_holds_ports() -> Result<()> {
+    // Closer simulation of real laptop sleep/wake: the old ControlMaster
+    // process is STILL ALIVE when the stale watchdog fires, still holding
+    // the bound local ports. The recovery code must free those ports before
+    // the new master tries to bind them, or the forward will fail to restore
+    // through the *new* master.
+    //
+    // We reproduce this by:
+    //   1. Starting autofwd and forwarding a port.
+    //   2. Pausing the container just long enough for the stale watchdog to
+    //      fire, but not long enough for ServerAliveInterval (15s) to kill
+    //      the master.
+    //   3. After recovery, killing the old master PID *manually*. If the new
+    //      master is actually handling the forward, data should still flow.
+    //      If the old master was secretly doing the work, data flow breaks.
+    if !agents_available() {
+        println!(
+            "Skipping test_forwards_restored_when_old_master_holds_ports - agents not available"
+        );
+        return Ok(());
+    }
+
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    let mut autofwd = AutofwdProcess::start_with_options(
+        &container,
+        "200ms",
+        &[],
+        &[
+            ("AUTOFWD_STALE_MS", "4000"),
+            ("AUTOFWD_AGENT_MAX_INTERVAL_MS", "500"),
+        ],
+    )?;
+
+    autofwd.wait_for_event("ready", Duration::from_secs(15))?;
+
+    container.start_listener(7795)?;
+    let added = autofwd.wait_for_event("forward_added", Duration::from_secs(15))?;
+    let local_port = added
+        .get("local_port")
+        .and_then(|p| p.as_u64())
+        .expect("forward_added should have local_port") as u16;
+
+    assert!(
+        wait_for_forward_data(local_port, "ready", Duration::from_secs(5)),
+        "forward on {} should carry data before pause",
+        local_port
+    );
+
+    // Record the PIDs of every ssh process currently bound to local_port.
+    // After the stale watchdog fires, we'll kill these "old" masters.
+    let old_master_pids = pids_listening_on_port(local_port);
+    println!(
+        "Old master PID(s) holding local port {}: {:?}",
+        local_port, old_master_pids
+    );
+    assert!(
+        !old_master_pids.is_empty(),
+        "expected an ssh master to be bound to local port {}",
+        local_port
+    );
+
+    container.pause()?;
+    std::thread::sleep(Duration::from_millis(5000));
+
+    autofwd.wait_for_event("connection_lost", Duration::from_secs(5))?;
+    container.unpause()?;
+
+    autofwd.wait_for_event("reconnected", Duration::from_secs(20))?;
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Now kill the OLD master(s). If autofwd's "new master" is actually
+    // serving the forward, killing the old master should not break data flow.
+    for pid in &old_master_pids {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let new_master_pids = pids_listening_on_port(local_port);
+    println!(
+        "New master PID(s) holding local port {} after old killed: {:?}",
+        local_port, new_master_pids
+    );
+
+    assert!(
+        wait_for_forward_data(local_port, "ready", Duration::from_secs(15)),
+        "forward on {} should still carry data after old master was killed; new_pids={:?}",
+        local_port,
+        new_master_pids
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_forward_verified_on_add() -> Result<()> {
+    // Verifies that newly-added forwards emit a forward_verified event
+    // shortly after forward_added, so the status overlay doesn't show
+    // "never verified" indefinitely.
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    let mut autofwd = AutofwdProcess::start(&container)?;
+    autofwd.wait_for_event("ready", Duration::from_secs(10))?;
+
+    container.start_listener(8088)?;
+
+    let added = autofwd.wait_for_event("forward_added", Duration::from_secs(10))?;
+    let local_port = added.get("local_port").and_then(|p| p.as_u64()).unwrap() as u16;
+
+    // Soon after, we should see a forward_verified event with alive=true.
+    let verified = autofwd.wait_for_event_matching(Duration::from_secs(5), |e| {
+        e.get("event").and_then(|v| v.as_str()) == Some("forward_verified")
+            && e.get("local_port").and_then(|p| p.as_u64()) == Some(local_port as u64)
+    })?;
+    assert_eq!(
+        verified.get("alive").and_then(|v| v.as_bool()),
+        Some(true),
+        "expected alive=true, got {:?}",
+        verified
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_reconnect_emits_rich_events() -> Result<()> {
+    // Verifies the observability work: during a sleep/wake cycle we emit
+    // stale_detected, master_terminated, master_started, restore_attempt,
+    // forward_verified, forward_restored — so the user can see what happened.
+    if !agents_available() {
+        println!("Skipping test_reconnect_emits_rich_events - agents not available");
+        return Ok(());
+    }
+
+    ensure_image_built()?;
+    let container = TestContainer::start()?;
+
+    let mut autofwd = AutofwdProcess::start_with_options(
+        &container,
+        "200ms",
+        &[],
+        &[
+            ("AUTOFWD_STALE_MS", "4000"),
+            ("AUTOFWD_AGENT_MAX_INTERVAL_MS", "500"),
+        ],
+    )?;
+
+    autofwd.wait_for_event("ready", Duration::from_secs(15))?;
+
+    container.start_listener(7798)?;
+    autofwd.wait_for_event("forward_added", Duration::from_secs(15))?;
+
+    container.pause()?;
+    std::thread::sleep(Duration::from_millis(5000));
+
+    // Collect events through forward_restored so we can assert on the sequence.
+    let (_restored, events) = {
+        let result = autofwd
+            .wait_for_event_collecting("connection_lost", Duration::from_secs(10))?
+            .1;
+        container.unpause()?;
+        let (restored, more) =
+            autofwd.wait_for_event_collecting("forward_restored", Duration::from_secs(25))?;
+        let mut combined = result;
+        combined.extend(more);
+        (restored, combined)
+    };
+
+    fn has(events: &[Value], name: &str) -> bool {
+        events
+            .iter()
+            .any(|e| e.get("event").and_then(|v| v.as_str()) == Some(name))
+    }
+
+    assert!(has(&events, "stale_detected"), "expected stale_detected");
+    assert!(
+        has(&events, "master_terminated"),
+        "expected master_terminated"
+    );
+    assert!(has(&events, "master_started"), "expected master_started");
+    assert!(has(&events, "restore_attempt"), "expected restore_attempt");
+    assert!(
+        has(&events, "forward_verified"),
+        "expected forward_verified"
+    );
+
+    // The stale_detected event should report an idle time at/above the threshold.
+    let stale = events
+        .iter()
+        .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("stale_detected"))
+        .unwrap();
+    let idle = stale
+        .get("idle_ms")
+        .and_then(|v| v.as_u64())
+        .expect("idle_ms in stale_detected");
+    assert!(idle >= 4000, "expected idle_ms >= 4000, got {}", idle);
+
+    Ok(())
+}
+
+/// Return all PIDs currently bound to the given local TCP port. macOS-only.
+fn pids_listening_on_port(port: u16) -> Vec<u32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", "-iTCP:", &format!("-iTCP:{}", port), "-sTCP:LISTEN"])
+        .args(["-t"])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+            .collect(),
+        _ => {
+            // Fallback: use `-i :port` form which works more broadly.
+            let out = std::process::Command::new("lsof")
+                .args(["-nP", "-t", "-i", &format!(":{}", port), "-sTCP:LISTEN"])
+                .output()
+                .ok();
+            out.and_then(|o| {
+                if o.status.success() {
+                    Some(
+                        String::from_utf8_lossy(&o.stdout)
+                            .split_whitespace()
+                            .filter_map(|s| s.parse::<u32>().ok())
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
+        }
+    }
 }

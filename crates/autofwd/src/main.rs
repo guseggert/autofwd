@@ -52,9 +52,111 @@ pub struct Args {
     #[arg(long)]
     pub assume_http: bool,
 
+    /// Write all events as JSON lines to this file. Defaults to
+    /// ~/Library/Logs/autofwd/<target>.log on macOS or
+    /// $XDG_STATE_HOME/autofwd/<target>.log on Linux. Pass /dev/null to disable.
+    #[arg(long, value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
+
+    /// Disable persistent event log file.
+    #[arg(long, conflicts_with = "log_file")]
+    pub no_log_file: bool,
+
     /// Extra args to pass to ssh (put them after `--`), e.g. -i key -p 2222 -J jump
     #[arg(last = true, value_name = "SSH_ARGS")]
     pub ssh_args: Vec<String>,
+}
+
+/// Compute the default log file path for the given SSH target.
+///
+/// macOS: `~/Library/Logs/autofwd/<safe-target>.log`
+/// Linux: `$XDG_STATE_HOME/autofwd/<safe-target>.log` (or `~/.local/state/autofwd/`)
+fn default_log_path(target: &str) -> Option<PathBuf> {
+    let base = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs/autofwd"))
+    } else {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state"))
+            })
+            .map(|p| p.join("autofwd"))
+    };
+
+    let base = base?;
+    // Sanitize target: replace characters that aren't filesystem-safe.
+    let safe: String = target
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+            _ => '_',
+        })
+        .collect();
+    Some(base.join(format!("{}.log", safe)))
+}
+
+/// Spawn a task that writes incoming events as JSON lines to the given file.
+/// Returns a sender the rest of the app should clone.
+///
+/// Errors on open are printed to stderr (best effort) and logging is disabled.
+fn spawn_log_writer(path: PathBuf) -> Option<tokio::sync::mpsc::UnboundedSender<Event>> {
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "autofwd: could not create log directory {}: {}",
+                parent.display(),
+                e
+            );
+            return None;
+        }
+    }
+
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("autofwd: could not open log file {}: {}", path.display(), e);
+            return None;
+        }
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let mut writer = tokio::fs::File::from_std(file);
+
+    tokio::spawn(async move {
+        // Write a session marker so we can find where this run started.
+        let _ = writer
+            .write_all(
+                format!(
+                    "{{\"event\":\"session_start\",\"ts\":\"{}\",\"pid\":{}}}\n",
+                    chrono::Utc::now().to_rfc3339(),
+                    std::process::id()
+                )
+                .as_bytes(),
+            )
+            .await;
+        let _ = writer.flush().await;
+
+        while let Some(event) = rx.recv().await {
+            if let Ok(json) = serde_json::to_string(&event) {
+                if writer.write_all(json.as_bytes()).await.is_err() {
+                    break;
+                }
+                if writer.write_all(b"\n").await.is_err() {
+                    break;
+                }
+                // Flush each event so crashes don't lose recent lines.
+                let _ = writer.flush().await;
+            }
+        }
+    });
+
+    Some(tx)
 }
 
 /// Guard that ensures SSH cleanup runs even on panic/early return.
@@ -121,8 +223,27 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Set up persistent log file (default: ~/Library/Logs/autofwd/<target>.log on macOS)
+    let log_path = if args.no_log_file {
+        None
+    } else {
+        args.log_file
+            .clone()
+            .or_else(|| default_log_path(&args.target))
+    };
+    let log_tx = log_path.as_ref().and_then(|p| spawn_log_writer(p.clone()));
+    let log_file_path_for_tui = log_path
+        .as_ref()
+        .filter(|_| log_tx.is_some())
+        .map(|p| p.display().to_string());
+    if let Some(p) = &log_path {
+        if log_tx.is_some() && !args.headless {
+            eprintln!("autofwd: logging to {}", p.display());
+        }
+    }
+
     // Create shared state, redraw notifier, and command channel
-    let (tui_state, redraw_notify) = new_shared_state(event_tx);
+    let (tui_state, redraw_notify) = new_shared_state(event_tx, log_tx, log_file_path_for_tui);
     let (cmd_tx, cmd_rx) = new_command_channel();
 
     // Spawn monitor task

@@ -32,6 +32,10 @@ pub struct ForwardedPort {
     pub enabled: bool,
     pub protocol: Protocol,
     pub process_name: Option<String>,
+    /// When the local port was last verified to be listening (TCP connect ok).
+    pub last_verified_at: Option<Instant>,
+    /// Whether the last verification attempt succeeded.
+    pub last_verified_ok: bool,
 }
 
 /// Commands from TUI to monitor for toggling forwards.
@@ -67,9 +71,19 @@ pub struct TuiState {
     /// Optional channel for JSON events (headless mode)
     #[allow(dead_code)]
     event_tx: Option<EventSender>,
+    /// Optional channel for log-file output (always on unless disabled).
+    log_tx: Option<EventSender>,
     pub snapshots_processed: u64,
     pub ssh_ops: u64,
     pub active_probes: u32,
+    /// Number of reconnect cycles since startup.
+    pub reconnect_count: u32,
+    /// Most recent time we saw data from the remote (heartbeat / snapshot).
+    pub last_agent_activity: Option<Instant>,
+    /// Most recent time the SSH ControlMaster was (re)started.
+    pub last_master_start: Option<Instant>,
+    /// Path to the persistent event log file, if enabled.
+    pub log_file_path: Option<String>,
 }
 
 impl TuiState {
@@ -77,6 +91,9 @@ impl TuiState {
     pub fn push_event(&mut self, event: JsonEvent) {
         // Also emit for headless mode JSON output
         if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event.clone());
+        }
+        if let Some(tx) = &self.log_tx {
             let _ = tx.send(event.clone());
         }
         self.events.push_back(event);
@@ -88,6 +105,9 @@ impl TuiState {
     /// Emit a structured event (for headless mode JSON output only, not stored).
     pub fn emit(&self, event: JsonEvent) {
         if let Some(tx) = &self.event_tx {
+            let _ = tx.send(event.clone());
+        }
+        if let Some(tx) = &self.log_tx {
             let _ = tx.send(event);
         }
     }
@@ -99,6 +119,7 @@ struct UiState {
     show_process: bool,
     show_quit_confirm: bool,
     show_debug: bool,
+    show_status: bool,
     table_state: TableState,
     events_view: bool,
     events_list_state: ListState,
@@ -187,7 +208,11 @@ pub enum TuiEvent {
     StateChanged,
 }
 
-pub fn new_shared_state(event_tx: Option<EventSender>) -> (SharedState, RedrawNotify) {
+pub fn new_shared_state(
+    event_tx: Option<EventSender>,
+    log_tx: Option<EventSender>,
+    log_file_path: Option<String>,
+) -> (SharedState, RedrawNotify) {
     let state = Arc::new(RwLock::new(TuiState {
         status: "connecting...".to_string(),
         forwarded: Vec::new(),
@@ -196,9 +221,14 @@ pub fn new_shared_state(event_tx: Option<EventSender>) -> (SharedState, RedrawNo
         events: VecDeque::new(),
         monitor_mode: MonitorModeDisplay::Unknown,
         event_tx,
+        log_tx,
         snapshots_processed: 0,
         ssh_ops: 0,
         active_probes: 0,
+        reconnect_count: 0,
+        last_agent_activity: None,
+        last_master_start: None,
+        log_file_path,
     }));
     let notify = Arc::new(tokio::sync::Notify::new());
     (state, notify)
@@ -255,6 +285,10 @@ impl Tui {
 
             if ui.show_debug {
                 render_debug_overlay(frame, area, state, &ui.render_stats);
+            }
+
+            if ui.show_status {
+                render_status_overlay(frame, area, state);
             }
         })?;
         Ok(())
@@ -397,9 +431,10 @@ fn render_main_view(
     frame.render_stateful_widget(table, chunks[1], &mut ui.table_state);
 
     // Footer
-    let footer = Paragraph::new(" ↑/↓ navigate • space toggle • d debug • ? help • q quit")
-        .style(Style::default().fg(Color::DarkGray))
-        .block(Block::default().borders(Borders::ALL));
+    let footer =
+        Paragraph::new(" ↑/↓ navigate • space toggle • s status • d debug • ? help • q quit")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 }
 
@@ -519,6 +554,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         "  ↓/j/^N   Move selection down",
         "  Space    Toggle port forwarding",
         "  p        Toggle process column",
+        "  s        Toggle status / diagnostics",
         "  d        Toggle debug stats",
         "  e        Open events view",
         "  ?        Show/hide this help",
@@ -659,6 +695,145 @@ fn render_debug_overlay(frame: &mut Frame, area: Rect, state: &TuiState, stats: 
     frame.render_widget(debug, popup_area);
 }
 
+/// Render the session-health status overlay ('s' key).
+///
+/// Designed for diagnosing "tunnels not restored after sleep" — shows idle
+/// time since last remote activity, reconnect history, master age, log file
+/// location, and per-forward verification status.
+fn render_status_overlay(frame: &mut Frame, area: Rect, state: &TuiState) {
+    fn idle_str(t: Option<Instant>) -> String {
+        match t {
+            Some(i) => format!("{}s ago", i.elapsed().as_secs()),
+            None => "—".to_string(),
+        }
+    }
+
+    let mode_str = match state.monitor_mode {
+        MonitorModeDisplay::Agent => "agent",
+        MonitorModeDisplay::Shell => "shell",
+        MonitorModeDisplay::Unknown => "unknown",
+    };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("  Status     ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(state.status.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Mode       ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(mode_str.to_string()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Last data  ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(idle_str(state.last_agent_activity)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Master age ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(idle_str(state.last_master_start)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Reconnects ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(state.reconnect_count.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Snapshots  ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(state.snapshots_processed.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("  SSH ops    ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(state.ssh_ops.to_string()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Log file   ", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(
+                state
+                    .log_file_path
+                    .clone()
+                    .unwrap_or_else(|| "(disabled)".to_string()),
+            ),
+        ]),
+    ];
+
+    // Per-forward verification summary (enabled forwards only).
+    let enabled: Vec<&ForwardedPort> = state.forwarded.iter().filter(|f| f.enabled).collect();
+    let disabled_count = state.forwarded.len() - enabled.len();
+
+    if !enabled.is_empty() || disabled_count > 0 {
+        lines.push(Line::from(""));
+        let header = if disabled_count > 0 {
+            format!(
+                "  Forwards  ({} active, {} disabled hidden)",
+                enabled.len(),
+                disabled_count
+            )
+        } else {
+            format!("  Forwards  ({})", enabled.len())
+        };
+        lines.push(Line::from(Span::styled(
+            header,
+            Style::default().fg(Color::Yellow).bold(),
+        )));
+    }
+
+    // Reserve space for header/footer/borders so we know how many forward
+    // rows will actually fit. If more exist than fit, truncate with a count.
+    // Rough budget: current lines + 1 (footer spacer) + 1 (footer) + 2 (borders).
+    let fixed_below = 3;
+    let fixed_above = lines.len() as u16 + 2; // +2 for borders top/bottom
+    let available_for_rows = area.height.saturating_sub(fixed_above + fixed_below);
+
+    let capacity = available_for_rows as usize;
+    let to_show = enabled.len().min(capacity);
+    for fwd in &enabled[..to_show] {
+        let verify = match (fwd.last_verified_at, fwd.last_verified_ok) {
+            (Some(t), true) => format!("verified {}s ago", t.elapsed().as_secs()),
+            (Some(t), false) => format!("BROKEN (checked {}s ago)", t.elapsed().as_secs()),
+            (None, _) => "pending verification".to_string(),
+        };
+        let line = format!(
+            "    :{:<6} → :{:<6} {}",
+            fwd.remote_port, fwd.local_port, verify
+        );
+        let style = if fwd.last_verified_at.is_some() && !fwd.last_verified_ok {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(line, style)));
+    }
+    let hidden_by_size = enabled.len().saturating_sub(to_show);
+    if hidden_by_size > 0 {
+        lines.push(Line::from(format!(
+            "    … and {} more (terminal too small)",
+            hidden_by_size
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("                        "),
+        Span::styled("[s] close", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    // Grow popup to fit content, capped by the available area.
+    let popup_width = 66.min(area.width.saturating_sub(2));
+    let popup_height = (lines.len() as u16 + 2).min(area.height);
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+    let status = Paragraph::new(lines)
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" Status "),
+        );
+    frame.render_widget(status, popup_area);
+}
+
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -777,6 +952,87 @@ fn format_event(event: &JsonEvent) -> String {
             min_ms,
             max_ms
         ),
+        Event::StaleDetected { ts, idle_ms } => {
+            format!("{} ⚠ stale detected (idle {}ms)", ts.to_rfc3339(), idle_ms)
+        }
+        Event::MasterTerminated {
+            ts,
+            summary,
+            killed_pid,
+        } => match killed_pid {
+            Some(pid) => format!(
+                "{} ✗ killed old master pid {} ({})",
+                ts.to_rfc3339(),
+                pid,
+                summary
+            ),
+            None => format!("{} terminated old master: {}", ts.to_rfc3339(), summary),
+        },
+        Event::MasterStarted { ts, duration_ms } => {
+            format!("{} ✓ master started ({}ms)", ts.to_rfc3339(), duration_ms)
+        }
+        Event::RestoreAttempt {
+            ts,
+            remote_port,
+            local_port,
+            attempt,
+            max_attempts,
+        } => format!(
+            "{} → restore :{} → :{} (attempt {}/{})",
+            ts.to_rfc3339(),
+            remote_port,
+            local_port,
+            attempt,
+            max_attempts
+        ),
+        Event::ForwardRestored {
+            ts,
+            remote_port,
+            local_port,
+            attempts,
+        } => format!(
+            "{} ✓ restored :{} → :{} ({} attempts)",
+            ts.to_rfc3339(),
+            remote_port,
+            local_port,
+            attempts
+        ),
+        Event::RestoreFailed {
+            ts,
+            remote_port,
+            local_port,
+            attempts,
+            reason,
+        } => format!(
+            "{} ✗ restore :{} → :{} failed after {} attempts: {}",
+            ts.to_rfc3339(),
+            remote_port,
+            local_port,
+            attempts,
+            reason
+        ),
+        Event::ForwardVerified {
+            ts,
+            remote_port,
+            local_port,
+            alive,
+        } => {
+            if *alive {
+                format!(
+                    "{} ✓ verified :{} → :{}",
+                    ts.to_rfc3339(),
+                    remote_port,
+                    local_port
+                )
+            } else {
+                format!(
+                    "{} ✗ verify failed :{} → :{}",
+                    ts.to_rfc3339(),
+                    remote_port,
+                    local_port
+                )
+            }
+        }
     }
 }
 
@@ -844,6 +1100,7 @@ pub async fn run_tui(
         show_process: false,
         show_quit_confirm: false,
         show_debug: false,
+        show_status: false,
         table_state: TableState::default(),
         events_view: false,
         events_list_state: ListState::default(),
@@ -973,6 +1230,9 @@ async fn handle_key_event(
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 ui.show_debug = !ui.show_debug;
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                ui.show_status = !ui.show_status;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let mut s = state.write().await;
