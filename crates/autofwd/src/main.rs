@@ -77,9 +77,7 @@ fn default_log_path(target: &str) -> Option<PathBuf> {
     } else {
         std::env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state"))
-            })
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
             .map(|p| p.join("autofwd"))
     };
 

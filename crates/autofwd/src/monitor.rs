@@ -580,15 +580,12 @@ async fn restore_one_forward(
 ) -> std::result::Result<u32, (u32, String)> {
     let mut last_err: Option<String> = None;
     for attempt in 1..=RESTORE_MAX_ATTEMPTS {
-        tui_state
-            .write()
-            .await
-            .push_event(Event::restore_attempt(
-                remote_port,
-                local_port,
-                attempt,
-                RESTORE_MAX_ATTEMPTS,
-            ));
+        tui_state.write().await.push_event(Event::restore_attempt(
+            remote_port,
+            local_port,
+            attempt,
+            RESTORE_MAX_ATTEMPTS,
+        ));
 
         match ssh_forward_add(ctx, local_port, remote_host, remote_port).await {
             Ok(()) => {
@@ -816,11 +813,7 @@ pub async fn run_monitor(
                         // Only emit an event on state change or initial check
                         // to keep the log readable.
                         if !had_prior || previously_ok != alive {
-                            tui.push_event(Event::forward_verified(
-                                remote_port,
-                                local_port,
-                                alive,
-                            ));
+                            tui.push_event(Event::forward_verified(remote_port, local_port, alive));
                         }
                     }
                 }
@@ -872,7 +865,7 @@ pub async fn run_monitor(
                     {
                         let mut tui = tui_state.write().await;
                         tui.push_event(Event::master_started(
-                            master_start.elapsed().as_millis() as u64,
+                            master_start.elapsed().as_millis() as u64
                         ));
                         tui.last_master_start = Some(Instant::now());
                         tui.reconnect_count += 1;
